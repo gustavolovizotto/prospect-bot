@@ -75,8 +75,9 @@ def leads():
         r["argumento"] = argumento(diag)
         r["proposta"] = bot.NICHOS.get(r["nicho"], {}).get("proposta", [])
         r["mensagem"] = bot.mensagem(r, perfil)  # sempre com o perfil atual
-        if r["etapa"] == "descartado" and not r["motivo"]:  # leads antigos, de antes da coluna motivo
-            r["motivo"] = bot.motivo_auto(diag, r["score"])
+        r["temperatura"] = bot.temperatura(r["score"] or 0)
+        r["analise"] = json.loads(r["analise"]) if r["analise"] else []
+        r["contatavel"] = r["tel_tipo"] in ("whatsapp", "celular")
     return rows
 
 
@@ -99,7 +100,7 @@ def fila():
                          (datetime.now().strftime("%Y-%m-%d"),)).fetchone()[0]
     for r in rows:
         r["whatsapp"] = fone_whats(r["telefone"])
-    return {"itens": rows, "enviados_hoje": hoje}
+    return {"itens": rows, "enviados_hoje": hoje, "limites": {"quente": bot.QUENTE, "morno": bot.MORNO}}
 
 
 def mexer_fila(d):
@@ -119,7 +120,7 @@ def mexer_fila(d):
         c.row_factory = sqlite3.Row
         for i in ids:
             r = c.execute("SELECT * FROM leads WHERE id=?", (i,)).fetchone()
-            if not r or not fone_whats(r["telefone"]) or r["envio"] == "enviado":
+            if not r or r["tel_tipo"] not in ("whatsapp", "celular") or r["envio"] == "enviado":
                 continue
             # congela a mensagem como está agora (perfil e saudação do momento)
             c.execute("UPDATE leads SET envio='fila', envio_msg=?, envio_erro=NULL WHERE id=?", (bot.mensagem(dict(r), perfil), i))

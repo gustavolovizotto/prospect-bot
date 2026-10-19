@@ -9,7 +9,7 @@ Uso:
   python3 bot.py --cidades "Campinas" --nichos dentista   # direto pela linha de comando
   python3 bot.py --export            # gera leads.csv ordenado por score
 """
-import argparse, csv, json, os, re, sqlite3, subprocess, sys, time, urllib.parse
+import argparse, csv, json, os, re, socket, sqlite3, subprocess, sys, time, unicodedata, urllib.parse
 from datetime import datetime
 
 UA = "lp-prospector/0.1 (prospeccao local)"
@@ -83,7 +83,8 @@ def db():
         score INTEGER, diagnostico TEXT, mensagem TEXT, link_whatsapp TEXT, criado TEXT)""")
     cols = [r[1] for r in c.execute("PRAGMA table_info(leads)")]
     # envio: NULL | fila | enviado | falhou  (fila de contato automático pelo WhatsApp Web)
-    for col in ("notas", "motivo", "envio", "envio_msg", "envio_em", "envio_erro"):
+    # analise: JSON [{pontos, texto}] explicando o score · tel_tipo: whatsapp | celular | fixo | NULL
+    for col in ("notas", "motivo", "envio", "envio_msg", "envio_em", "envio_erro", "analise", "tel_tipo"):
         if col not in cols:
             c.execute(f"ALTER TABLE leads ADD COLUMN {col} TEXT")
     return c
@@ -142,7 +143,8 @@ def buscar_osm(cidade, nicho):
         t = e["tags"]
         end = " ".join(filter(None, [t.get("addr:street"), t.get("addr:housenumber"), t.get("addr:suburb")]))
         yield {"id": f"osm:{e['type']}{e['id']}", "nome": t["name"], "endereco": end,
-               "telefone": t.get("contact:whatsapp") or t.get("phone") or t.get("contact:phone") or t.get("contact:mobile"),
+               "telefone": t.get("contact:whatsapp") or t.get("contact:mobile") or t.get("phone") or t.get("contact:phone"),
+               "whatsapp": bool(t.get("contact:whatsapp")),
                "site": t.get("website") or t.get("contact:website") or t.get("contact:instagram"),
                "avaliacoes": None, "fonte": "osm"}
 
@@ -172,38 +174,218 @@ def buscar_google(cidade, nicho, key):
 
 
 # ---------- 2) qualificação ----------
-def qualificar(site, avaliacoes):
-    """Retorna (score 0-100, diagnóstico). Quanto maior, mais precisa de landing page."""
-    if not site:
-        s, d = 90, "sem site"
-    elif any(x in site.lower() for x in SOCIAL):
-        s, d = 85, "só rede social como site"
+# Score = soma de critérios explicados (lead["analise"]). Quente: sem site + celular + nicho que paga.
+QUENTE, MORNO, MINIMO = 70, 45, 40  # abaixo de MINIMO o bot descarta
+TICKET = {"dentista": 15, "advogado": 15, "clinica": 15, "fisioterapia": 15, "veterinario": 15,
+          "academia": 10, "contador": 10, "salao": 10, "oficina": 10, "restaurante": 5, "padaria": 5, "pet": 5}
+# palavras (sem acento) que confirmam que um site encontrado na web é mesmo desse nicho
+CHAVES = {"dentista": ("odonto", "dentist", "dentari", "implante", "ortodont"),
+          "salao": ("salao", "cabelo", "beleza", "estetica", "manicure", "escova"),
+          "academia": ("academia", "treino", "musculacao", "fitness", "crossfit"),
+          "advogado": ("advoca", "advogad", "juridic", "direito"),
+          "contador": ("contab", "contador", "fiscal"),
+          "veterinario": ("veterin", "animais", "pet"),
+          "fisioterapia": ("fisioter", "pilates", "reabilit"),
+          "clinica": ("clinica", "medic", "consulta", "saude"),
+          "oficina": ("oficina", "mecanic", "automotiv", "veicul"),
+          "restaurante": ("restaurante", "cardapio", "delivery", "reserva"),
+          "padaria": ("padaria", "confeitaria", "paes", "encomenda"),
+          "pet": ("pet", "banho", "tosa", "racao")}
+# ponytail: lista curta de redes; nomes repetidos 3+ vezes na base também contam como rede
+REDES = ("cobasi", "petz", "petland", "sorridents", "odontocompany", "oralsin", "odonto excellence", "orthodontic",
+         "smart fit", "smartfit", "bluefit", "selfit", "bio ritmo", "bodytech", "dr consulta", "amor saude", "amorsaude",
+         "mcdonald", "burger king", "subway", "outback", "habib", "bob's", "spoleto", "giraffas", "china in box",
+         "cacau show", "kopenhagen", "o boticario", "jacques janine", "espacolaser", "depyl action", "drogasil",
+         "droga raia", "pague menos", "lavoisier", "fleury", "dasa", "sabin", "hermes pardini")
+PUBLICO = re.compile(r"\b(ubs|usf|caps|upa|ama|posto de saude|unidade basica|prefeitura|secretaria|hospital municipal|"
+                     r"centro de saude|policlinica|pronto atendimento municipal|senai|sesi|sesc)\b")
+DIRETORIOS = ("google.", "bing.", "facebook.", "instagram.", "linkedin.", "youtube.", "tiktok.", "twitter.", "x.com",
+              "wikipedia.", "doctoralia.", "boaconsulta.", "guiamais.", "apontador.", "telelistas.", "solutudo.",
+              "cnpj", "econodata.", "ifood.", "tripadvisor.", "reclameaqui.", "jusbrasil.", "escavador.", "mercadolivre.",
+              "agendarconsulta.", "eguias.", "guialocal", "encontra", "listamais.", "yelp.", "waze.", "maps.", "gov.br")
+GENERICAS = {"de", "da", "do", "das", "dos", "e", "a", "o", "em", "ltda", "me", "eireli", "dr", "dra", "clinica",
+             "consultorio", "odontologia", "odontologica", "odonto", "dentista", "dental", "saude", "integrada",
+             "radiologia", "salao", "beleza", "studio", "estudio", "espaco", "academia", "fitness", "advocacia",
+             "advogados", "associados", "escritorio", "contabilidade", "contabil", "veterinaria", "veterinario", "vet",
+             "pet", "shop", "petshop", "restaurante", "padaria", "confeitaria", "oficina", "mecanica", "auto",
+             "center", "centro", "fisioterapia", "fisio", "medica", "medicina", "instituto", "grupo", "casa"}
+
+
+def sem_acento(s):
+    return unicodedata.normalize("NFKD", (s or "").lower()).encode("ascii", "ignore").decode()
+
+
+def tipo_telefone(tel, whatsapp=False):
+    """whatsapp (cadastrado como WhatsApp) | celular (11 dígitos com 9: quase sempre tem WhatsApp) | fixo | None"""
+    d = re.sub(r"\D", "", tel or "")
+    if d.startswith("55") and len(d) > 11:
+        d = d[2:]
+    d = d.lstrip("0")
+    if len(d) == 11 and d[2] == "9":
+        return "whatsapp" if whatsapp else "celular"
+    if len(d) == 10:
+        return "whatsapp" if whatsapp else "fixo"
+    return None
+
+
+def palavras(nome):
+    todas = re.findall(r"[a-z0-9]+", sem_acento(nome_curto(nome)))
+    return todas, [w for w in todas if w not in GENERICAS]
+
+
+_ultima_busca = [0.0]
+
+
+def bing(q):
+    """Hosts e caminhos dos resultados do Bing. Pode vir vazio ou com lixo: tudo é confirmado depois."""
+    espera = 3 - (time.time() - _ultima_busca[0])
+    if espera > 0:
+        time.sleep(espera)
+    _ultima_busca[0] = time.time()
+    try:
+        _, h, _ = http("https://www.bing.com/search?setlang=pt-BR&cc=BR&q=" + urllib.parse.quote(q), timeout=20,
+                       headers={"Accept-Language": "pt-BR", "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) "
+                                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"})
+    except Exception:
+        return []
+    out = []
+    for c in re.findall(r"<cite[^>]*>(.*?)</cite>", h, re.S):
+        c = re.sub(r"<[^>]+>|^https?://", "", c).replace(" › ", "/").split(" ")[0]
+        host, _, caminho = c.partition("/")
+        out.append((host.lower().removeprefix("www."), caminho))
+    return out
+
+
+def site_e_da_empresa(url, cidade, nicho, forte):
+    """Abre o site e confirma que é desse nicho (e, quando o domínio só bate em parte do nome, dessa cidade)."""
+    try:
+        final, html, _ = http(url, timeout=12)
+    except Exception:
+        return None
+    h = sem_acento(html)
+    if not any(k in h for k in CHAVES.get(nicho, ())):
+        return None
+    if not forte and sem_acento(cidade) not in h:
+        return None
+    return final
+
+
+def buscar_site(nome, cidade, nicho):
+    """Procura o site de um lead cadastrado sem site. -> (url, "site"|"social") ou (None, None)"""
+    todas, dist = palavras(nome)
+    cheio, nucleo = "".join(todas), "".join(dist)
+    # 1) domínios óbvios: nome inteiro, nome sem palavras genéricas, primeira palavra distintiva
+    cand = [(cheio, True)] + ([(nucleo, len(dist) > 1 or nucleo == cheio)] if len(nucleo) >= 4 else []) + \
+           ([(dist[0], False)] if dist and len(dist[0]) >= 5 else [])
+    vistos = set()
+    for slug, forte in cand:
+        for tld in (".com.br", ".com"):
+            dom = slug + tld
+            if dom in vistos or len(slug) < 4:
+                continue
+            vistos.add(dom)
+            try:
+                socket.getaddrinfo(dom, 443)
+            except (OSError, UnicodeError):
+                continue
+            achou = site_e_da_empresa("https://" + dom, cidade, nicho, forte)
+            if achou:
+                return achou, "site"
+    # 2) busca na web pelo nome entre aspas
+    social = None
+    for host, caminho in bing(f'"{nome_curto(nome)}" {cidade}'):
+        rotulo = host.split(".")[0]
+        if host.startswith("instagram.") and nucleo and nucleo[:6] in sem_acento(caminho).replace(".", "").replace("_", ""):
+            social = social or f"https://instagram.com/{caminho.split('/')[0]}"
+            continue
+        if any(d in host for d in DIRETORIOS):
+            continue
+        forte = len(nucleo) >= 4 and nucleo in rotulo.replace("-", "")
+        if forte or (dist and len(dist[0]) >= 5 and dist[0] in rotulo):
+            achou = site_e_da_empresa("https://" + host, cidade, nicho, forte)
+            if achou:
+                return achou, "site"
+    return (social, "social") if social else (None, None)
+
+
+def diagnosticar_site(site):
+    """-> (pontos de dor, diagnóstico)"""
+    if any(x in site.lower() for x in SOCIAL):
+        return 35, "só rede social como site"
+    url = site if site.startswith("http") else "http://" + site
+    try:
+        final, html, dt = http(url, timeout=15)
+    except Exception as e:
+        e = str(e)
+        motivo = ("domínio não existe" if "(6)" in e else "não responde" if "(28)" in e or "(7)" in e
+                  else "certificado inválido" if "(60)" in e or "(35)" in e else e[:40])
+        return 40, f"site fora do ar ({motivo})"
+    html = html[:400_000].lower()
+    probs = []
+    if not final.startswith("https"):
+        probs.append("sem https")
+    if 'name="viewport"' not in html and "name=viewport" not in html:
+        probs.append("não é mobile")
+    if dt > 4:
+        probs.append(f"lento ({dt:.0f}s)")
+    if len(re.sub(r"<[^>]+>", "", html).split()) < 80:
+        probs.append("quase sem conteúdo")
+    m = re.search(r"©\s*(?:\d{4}\s*[-–]\s*)?(20[01]\d)", html)
+    if m:
+        probs.append(f"copyright {m.group(1)}")
+    return min(30, 10 * len(probs)), ", ".join(probs) or "site ok"
+
+
+def desqualificar(nome, repetidos=0):
+    n = sem_acento(nome)
+    if PUBLICO.search(n):
+        return "Órgão ou serviço público: não contrata site dessa forma."
+    if any(r in n for r in REDES) or repetidos >= 3:
+        return "Rede ou franquia: já tem site corporativo e decide o marketing fora da unidade."
+    return None
+
+
+def analisar(lead, repetidos=0, buscar=True):
+    """Qualifica um lead. -> {score, diagnostico, analise, tel_tipo, site, desqualificado}"""
+    fora = desqualificar(lead["nome"], repetidos)
+    tel = tipo_telefone(lead.get("telefone"), lead.get("whatsapp"))
+    if fora:
+        return {"score": 0, "diagnostico": "desqualificado", "analise": [{"pontos": 0, "texto": fora}],
+                "tel_tipo": tel, "site": lead.get("site"), "desqualificado": fora}
+    a, site = [], lead.get("site")
+    if not site and buscar:
+        site, tipo = buscar_site(lead["nome"], lead.get("cidade", ""), lead.get("nicho"))
+        if site:
+            a.append({"pontos": 0, "texto": f"{'Perfil' if tipo == 'social' else 'Site'} encontrado na busca: "
+                                            f"{re.sub(r'^https?://(www[.])?', '', site).rstrip('/')}"})
+    if site:
+        dor, diag = diagnosticar_site(site)
+        a.append({"pontos": dor, "texto": {"site ok": "Site em ordem: pouca dor para resolver",
+                                           "só rede social como site": "Só tem rede social, sem site próprio"}.get(
+                                               diag, f"Site com problemas: {diag}" if "fora do ar" not in diag else diag.capitalize())})
     else:
-        url = site if site.startswith("http") else "http://" + site
-        try:
-            final, html, dt = http(url, timeout=15)
-            html = html[:400_000].lower()
-            probs = []
-            if not final.startswith("https"):
-                probs.append("sem https")
-            if 'name="viewport"' not in html and "name=viewport" not in html:
-                probs.append("não é mobile")
-            if dt > 4:
-                probs.append(f"lento ({dt:.0f}s)")
-            if len(re.sub(r"<[^>]+>", "", html).split()) < 80:
-                probs.append("quase sem conteúdo")
-            m = re.search(r"©\s*(?:\d{4}\s*[-–]\s*)?(20[01]\d)", html)
-            if m:
-                probs.append(f"copyright {m.group(1)}")
-            s, d = 20 + 15 * len(probs), ", ".join(probs) or "site ok"
-        except Exception as e:
-            e = str(e)
-            motivo = ("domínio não existe" if "(6)" in e else "não responde" if "(28)" in e or "(7)" in e
-                      else "certificado inválido" if "(60)" in e or "(35)" in e else e[:40])
-            s, d = 80, f"site fora do ar ({motivo})"
-    if avaliacoes:  # negócio com movimento = paga
-        s += min(10, avaliacoes // 20)
-    return min(s, 100), d
+        dor, diag = 40, "sem site"
+        a.append({"pontos": 40, "texto": "Sem site: nada no cadastro" + (" nem na busca pela web" if buscar else "")})
+    pts = {"whatsapp": 25, "celular": 25, "fixo": 5}.get(tel, 0)
+    a.append({"pontos": pts, "texto": {"whatsapp": "WhatsApp cadastrado", "celular": "Celular: provavelmente tem WhatsApp",
+                                       "fixo": "Só telefone fixo: WhatsApp improvável"}.get(tel, "Sem telefone válido")})
+    t = TICKET.get(lead.get("nicho"), 5)
+    a.append({"pontos": t, "texto": {15: "Nicho de ticket alto", 10: "Nicho de ticket médio"}.get(t, "Nicho de ticket baixo")})
+    if lead.get("avaliacoes"):
+        av = 10 if lead["avaliacoes"] >= 50 else 5 if lead["avaliacoes"] >= 10 else 0
+        a.append({"pontos": av, "texto": f"{lead['avaliacoes']} avaliações no Google"})
+    return {"score": min(100, sum(x["pontos"] for x in a)), "diagnostico": diag, "analise": a, "tel_tipo": tel,
+            "site": site, "desqualificado": None}
+
+
+def temperatura(score):
+    return "quente" if score >= QUENTE else "morno" if score >= MORNO else "frio"
+
+
+def etapa_auto(q):
+    if q["desqualificado"] or q["score"] < MINIMO:
+        return "descartado"
+    return "abordagem_pronta" if q["tel_tipo"] in ("whatsapp", "celular") else "qualificado"
 
 
 # ---------- 3) abordagem ----------
@@ -265,11 +447,17 @@ def mensagem(lead, perfil=None, hora=None):
             f"Se não for o momento, sem problema. Agradeço a atenção.\n{assinatura}")
 
 
-def motivo_auto(diag, score):
-    """Por que o bot descartou (score < 50)."""
-    if diag == "site ok":
+MOTIVOS_AUTO = ("O site atual está em ordem", "Site com problemas leves", "Pontuação baixa", "Órgão ou serviço público", "Rede ou franquia")
+
+
+def motivo_auto(q):
+    """Por que o bot descartou. Começa sempre com um de MOTIVOS_AUTO (assim a requalificação sabe que pode mexer)."""
+    if q["desqualificado"]:
+        return q["desqualificado"]
+    if q["diagnostico"] == "site ok":
         return "O site atual está em ordem: tem HTTPS, funciona no celular, carrega rápido e tem conteúdo. Baixa chance de troca."
-    return f"Site com problemas leves ({diag}). A dor não justifica uma abordagem agora (score {score})."
+    return f"Pontuação baixa ({q['score']} de no mínimo {MINIMO}): " + "; ".join(
+        x["texto"].lower() for x in q["analise"] if x["pontos"] < 20) + "."
 
 
 def link_whatsapp(tel, msg):
@@ -288,9 +476,30 @@ def log(msg):
     print(f"[{datetime.now():%H:%M:%S}] {msg}", flush=True)
 
 
+def contar_nomes(c):
+    """nome normalizado -> quantas vezes aparece (3+ = rede)"""
+    cont = {}
+    for (n,) in c.execute("SELECT nome FROM leads"):
+        k = sem_acento(nome_curto(n))
+        cont[k] = cont.get(k, 0) + 1
+    return cont
+
+
+def gravar_qualificacao(c, id_, lead, q, perfil, mexer_etapa=True):
+    msg = mensagem({**lead, "diagnostico": q["diagnostico"], "site": q["site"]}, perfil)
+    etapa = etapa_auto(q)
+    c.execute("""UPDATE leads SET score=?, diagnostico=?, analise=?, tel_tipo=?, site=?, mensagem=?, link_whatsapp=?
+                 WHERE id=?""", (q["score"], q["diagnostico"], json.dumps(q["analise"], ensure_ascii=False), q["tel_tipo"],
+                                 q["site"], msg, link_whatsapp(lead.get("telefone"), msg) if q["tel_tipo"] else None, id_))
+    if mexer_etapa:
+        c.execute("UPDATE leads SET etapa=?, motivo=? WHERE id=?",
+                  (etapa, motivo_auto(q) if etapa == "descartado" else None, id_))
+
+
 def rodada(c, cidades, nichos):
     key = os.environ.get("GOOGLE_PLACES_KEY")
     perfil = carregar_config().get("perfil", {})
+    nomes = contar_nomes(c)
     total, i = len(cidades) * len(nichos), 0
     for cidade in cidades:
         for nicho in nichos:
@@ -301,21 +510,38 @@ def rodada(c, cidades, nichos):
             for lead in achados:
                 if c.execute("SELECT 1 FROM leads WHERE id=?", (lead["id"],)).fetchone():
                     continue
-                score, diag = qualificar(lead["site"], lead["avaliacoes"])
-                lead.update(nicho=nicho, cidade=cidade, score=score, diagnostico=diag)
-                msg = mensagem(lead, perfil)
-                wa = link_whatsapp(lead["telefone"], msg)
-                etapa = "abordagem_pronta" if wa and score >= 50 else ("qualificado" if score >= 50 else "descartado")
-                c.execute("""INSERT INTO leads(id, nome, nicho, cidade, endereco, telefone, site, avaliacoes, fonte, etapa,
-                             score, diagnostico, mensagem, link_whatsapp, criado, motivo)
-                             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                k = sem_acento(nome_curto(lead["nome"]))
+                nomes[k] = nomes.get(k, 0) + 1
+                lead.update(nicho=nicho, cidade=cidade)
+                q = analisar(lead, nomes[k])
+                c.execute("""INSERT INTO leads(id, nome, nicho, cidade, endereco, telefone, site, avaliacoes, fonte, criado)
+                             VALUES(?,?,?,?,?,?,?,?,?,?)""",
                           (lead["id"], lead["nome"], nicho, cidade, lead["endereco"], lead["telefone"], lead["site"],
-                           lead["avaliacoes"], lead["fonte"], etapa, score, diag, msg, wa, datetime.now().isoformat(),
-                           motivo_auto(diag, score) if etapa == "descartado" else None))
+                           lead["avaliacoes"], lead["fonte"], datetime.now().isoformat()))
+                gravar_qualificacao(c, lead["id"], lead, q, perfil)
                 c.commit()
                 novos += 1
             log(f"  +{novos} leads novos")
             time.sleep(5 if key else 15)  # ponytail: rate limit fixo; Overpass é público e compartilhado
+
+
+def requalificar(c):
+    """Reaplica a qualificação atual em todos os leads, sem buscar no mapa de novo.
+    Etapas que você mudou à mão (contatado, negociando, descartes com seu motivo...) são preservadas."""
+    c.row_factory = sqlite3.Row
+    perfil = carregar_config().get("perfil", {})
+    nomes = contar_nomes(c)
+    rows = [dict(r) for r in c.execute("SELECT * FROM leads ORDER BY score DESC")]
+    for i, r in enumerate(rows, 1):
+        if i % 10 == 1:
+            log(f"Requalificando {i}/{len(rows)}")
+        q = analisar(r, nomes.get(sem_acento(nome_curto(r["nome"])), 0))
+        auto = r["etapa"] in ("abordagem_pronta", "qualificado") or (
+            r["etapa"] == "descartado" and (not r["motivo"] or r["motivo"].startswith(MOTIVOS_AUTO)))
+        gravar_qualificacao(c, r["id"], r, q, perfil, mexer_etapa=auto and not r["envio"])
+        c.commit()
+    c.row_factory = None
+    log("requalificação concluída: " + str(dict(c.execute("SELECT etapa, COUNT(*) FROM leads GROUP BY etapa").fetchall())))
 
 
 def exportar(c, path="leads.csv"):
@@ -333,17 +559,30 @@ def demo():
     assert link_whatsapp("(19) 3342-5050", "oi") == "https://wa.me/551933425050?text=oi"
     assert link_whatsapp("+55 19 99999-0000", "a b").endswith("5519999990000?text=a%20b")
     assert link_whatsapp("123", "x") is None and link_whatsapp(None, "x") is None
-    assert qualificar(None, None) == (90, "sem site")
-    assert qualificar("https://instagram.com/x", 400)[0] == 95
+    assert [tipo_telefone(t) for t in ("+55 19 99999-0000", "(19) 3342-5050", "123", None)] == ["celular", "fixo", None, None]
+    assert tipo_telefone("19 3342-5050", whatsapp=True) == "whatsapp"
+    assert desqualificar("UBS Jardim Aurélia") and desqualificar("Cobasi Cambuí") and desqualificar("Clínica X", 3)
+    assert not desqualificar("Navarro Odontologia")
+    quente = analisar({"nome": "X", "nicho": "dentista", "telefone": "19 99999-0000"}, buscar=False)
+    assert quente["score"] == 80 and temperatura(quente["score"]) == "quente" and etapa_auto(quente) == "abordagem_pronta"
+    fixo = analisar({"nome": "X", "nicho": "dentista", "telefone": "19 3342-5050"}, buscar=False)
+    assert fixo["score"] == 60 and temperatura(60) == "morno" and etapa_auto(fixo) == "qualificado"
+    sem_tel_baixo = analisar({"nome": "X", "nicho": "padaria"}, buscar=False)
+    assert sem_tel_baixo["score"] == 45 and etapa_auto(sem_tel_baixo) == "qualificado"
+    rede = analisar({"nome": "Petz", "nicho": "pet", "telefone": "11 99999-0000"}, buscar=False)
+    assert etapa_auto(rede) == "descartado" and motivo_auto(rede).startswith(MOTIVOS_AUTO)
+    assert sum(x["pontos"] for x in quente["analise"]) == quente["score"]
     assert nome_curto("Consultório X - Dra. Y | Lentes") == "Consultório X"
-    assert [saudacao(h) for h in (0, 5, 11, 12, 17, 18, 23)] == ["Boa noite", "Bom dia", "Bom dia", "Boa tarde", "Boa tarde", "Boa noite", "Boa noite"]
+    assert palavras("Navarro Odontologia") == (["navarro", "odontologia"], ["navarro"])
     assert juntar(["a"]) == "a" and juntar(["a", "b", "c"]) == "a, b e c"
+    assert [saudacao(h) for h in (0, 5, 11, 12, 17, 18, 23)] == ["Boa noite", "Bom dia", "Bom dia", "Boa tarde", "Boa tarde", "Boa noite", "Boa noite"]
     m = mensagem({"nome": "Oralcamp", "nicho": "dentista", "diagnostico": "sem https, não é mobile", "site": "https://www.x.com.br/"},
                  {"nome": "Gustavo", "portfolio": "gustavo.dev"}, hora=9)
     assert m.startswith("Bom dia") and "Gustavo" in m and "(x.com.br)" in m and "“Não seguro” no navegador e não se adapta" in m, m
     assert "[seu nome]" in mensagem({"nome": "A", "nicho": "pet", "diagnostico": "sem site"})
-    for k, n in NICHOS.items():  # toda entrada precisa dos campos usados na mensagem
+    for k, n in NICHOS.items():  # toda entrada precisa dos campos usados na mensagem e na qualificação
         assert {"osm", "busca", "rotulo", "segmento", "publico", "escolha", "conversao", "itens", "proposta"} <= n.keys(), k
+        assert k in TICKET and k in CHAVES, k
     print("ok")
 
 
@@ -353,11 +592,15 @@ if __name__ == "__main__":
     ap.add_argument("--nichos", default=",".join(NICHOS))
     ap.add_argument("--loop", action="store_true", help=f"repete a cada {INTERVALO_HORAS}h, adicionando só leads novos")
     ap.add_argument("--export", action="store_true")
+    ap.add_argument("--requalificar", action="store_true", help="reaplica a qualificação atual em todos os leads")
     ap.add_argument("--test", action="store_true")
     a = ap.parse_args()
     if a.test:
         sys.exit(demo())
     c = db()
+    if a.requalificar:
+        requalificar(c)
+        sys.exit(0)
     if not a.export:
         while True:
             rodada(c, [x.strip() for x in a.cidades.split(",")], [x.strip() for x in a.nichos.split(",")])

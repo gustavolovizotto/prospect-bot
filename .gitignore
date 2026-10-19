@@ -4,3 +4,4 @@ run.log
 __pycache__/
 .claude/
 config.json
+requalificacao.log

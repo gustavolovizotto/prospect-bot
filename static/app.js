@@ -33,7 +33,8 @@ const $ = (s) => document.querySelector(s);
 // ---------- utilidades ----------
 const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
-const temperatura = (l) => (l.score >= 80 ? "quente" : l.score >= 50 ? "morno" : "frio");
+const temperatura = (l) => l.temperatura;  // calculada no servidor (bot.QUENTE / bot.MORNO)
+const TEL_TIPO = { whatsapp: "WhatsApp cadastrado", celular: "Celular · provável WhatsApp", fixo: "Fixo · sem WhatsApp" };
 const nicho = (id) => estado.bot?.nichos.find((n) => n.id === id)?.rotulo || id.charAt(0).toUpperCase() + id.slice(1);
 const urlSite = (s) => (!s ? "" : /^https?:\/\//i.test(s) ? s : "http://" + s);
 const hostSite = (s) => s.replace(/^https?:\/\/(www\.)?/i, "").replace(/\/$/, "");
@@ -208,6 +209,15 @@ function renderLead(l) {
 
     <div class="cols">
       <div>
+        ${l.analise.length ? `
+        <section class="section">
+          <h2><i class="ph ph-chart-bar"></i>Por que essa nota</h2>
+          <ul class="pontos">${l.analise.map((x) => `
+            <li><span class="pts ${x.pontos ? "" : "zero"}">${x.pontos ? "+" + x.pontos : "·"}</span>${esc(x.texto)}</li>`).join("")}
+            <li class="total"><span class="pts">${l.score}</span>Total · ${TEMP_NOME[temperatura(l)]}</li>
+          </ul>
+        </section>` : ""}
+
         <section class="section">
           <h2><i class="ph ph-stethoscope"></i>Diagnóstico</h2>
           ${a.problemas.length ? `<ul class="problemas">${a.problemas.map((p) => `
@@ -242,7 +252,7 @@ function renderLead(l) {
         <section class="section">
           <h2><i class="ph ph-storefront"></i>Contato</h2>
           <div class="card"><dl class="dl">
-            <div><i class="ph ph-phone"></i><dt>Telefone</dt><dd>${l.telefone ? esc(l.telefone) : '<span class="nada">Não informado</span>'}</dd></div>
+            <div><i class="ph ph-phone"></i><dt>Telefone</dt><dd>${l.telefone ? `${esc(l.telefone)}${l.tel_tipo ? `<span class="tel-tipo ${l.contatavel ? "ok" : ""}">${TEL_TIPO[l.tel_tipo]}</span>` : ""}` : '<span class="nada">Não informado</span>'}</dd></div>
             <div><i class="ph ph-map-pin"></i><dt>Endereço</dt><dd>${l.endereco ? esc(l.endereco) : '<span class="nada">Não informado</span>'}</dd></div>
             <div><i class="ph ph-globe"></i><dt>Site atual</dt><dd>${site ? `<a href="${esc(site)}" target="_blank" rel="noopener">${esc(hostSite(l.site))}</a>` : '<span class="nada">Não tem</span>'}</dd></div>
           </dl></div>
@@ -585,7 +595,8 @@ async function pollBot() {
 }
 
 // ---------- contato automático ----------
-const elegivel = (l) => !!foneWhats(l) && ["abordagem_pronta", "qualificado"].includes(l.etapa) && !l.envio;
+// só quem dá para chamar no WhatsApp (celular ou WhatsApp cadastrado) e ainda não foi abordado
+const elegivel = (l) => l.contatavel && l.etapa === "abordagem_pronta" && !l.envio;
 
 function candidatos() {
   const { temp, nicho: n, cidade: c } = estado.cf;
@@ -662,10 +673,12 @@ function renderContato() {
         ${lista.map((l) => `
         <label class="sel-item">
           <input type="checkbox" data-marcar="${esc(l.id)}" ${estado.marcados.has(l.id) ? "checked" : ""}>
-          <span class="sel-nome"><strong>${esc(l.nome)}</strong><span>${esc(nicho(l.nicho))} · ${esc(l.cidade)} · ${esc(l.diagnostico)}</span></span>
+          <span class="sel-nome"><strong>${esc(l.nome)}</strong><span>${esc(nicho(l.nicho))} · ${esc(l.cidade)} · ${esc(l.diagnostico)} · ${esc(TEL_TIPO[l.tel_tipo])}</span></span>
           <span class="score"><span class="dot ${temperatura(l)}"></span>${l.score}</span>
         </label>`).join("")}
       </div>` : `<p class="ok-site">Nenhum lead com WhatsApp disponível nesse filtro.</p>`}
+      ${(() => { const fora = estado.leads.filter((l) => !l.contatavel && ["abordagem_pronta", "qualificado"].includes(l.etapa)).length;
+        return fora ? `<p class="hint"><i class="ph ph-info"></i> ${fora} leads qualificados não aparecem aqui por terem só telefone fixo ou nenhum telefone. Eles continuam na lista lateral.</p>` : ""; })()}
     </section>
 
     ${historico.length ? `
