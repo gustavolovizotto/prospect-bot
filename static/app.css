@@ -485,3 +485,34 @@ a { color: inherit; }
 .tel-tipo { display: block; font-size: 12px; color: var(--ink-3); }
 .tel-tipo.ok { color: var(--accent); }
 .hint .ph { vertical-align: -2px; }
+
+/* ---------- Enviar em sequência ---------- */
+.seq-fundo { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; padding: 16px; background: rgba(20, 19, 17, .45); }
+.seq {
+  width: min(560px, 100%); max-height: calc(100vh - 32px); overflow: auto; padding: 20px 22px 22px;
+  border-radius: 14px; background: var(--surface); border: 1px solid var(--line); box-shadow: 0 24px 64px rgba(0, 0, 0, .25);
+}
+.seq-head { display: flex; align-items: flex-start; justify-content: space-between; }
+.seq-head .eyebrow { margin-bottom: 2px; }
+.seq-head strong { font-size: 18px; letter-spacing: -.01em; }
+.seq .barra { margin: 14px 0 18px; }
+.seq-lead { display: flex; flex-direction: column; margin-bottom: 10px; }
+.seq-lead strong { font-size: 15px; }
+.seq-lead span { font-size: 13px; color: var(--ink-3); }
+.seq-msg { max-height: 220px; overflow: auto; margin: 0 0 16px; }
+.seq-passos { margin: 0 0 18px; padding-left: 20px; display: grid; gap: 4px; color: var(--ink-3); font-size: 13px; }
+.seq-passos .atual { color: var(--ink); font-weight: 500; }
+.seq-passos .feito { color: var(--accent); text-decoration: line-through; }
+kbd { padding: 1px 6px; border: 1px solid var(--line-strong); border-bottom-width: 2px; border-radius: 4px; font: 12px ui-monospace, Menlo, monospace; background: var(--sunken); }
+.seq-acoes { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.seq-acoes #seqPular { margin-right: auto; }
+.seq-fim { text-align: center; padding: 12px 0 4px; }
+.seq-fim > i { font-size: 36px; color: var(--accent); }
+.seq-fim p { margin: 8px 0 16px; color: var(--ink-2); }
+.comando .btn.grande { flex: none; }
+.hint code { padding: 1px 6px; border-radius: 4px; background: var(--sunken); font-size: 12px; }
+@media (max-width: 760px) {
+  .seq-acoes { flex-direction: column-reverse; align-items: stretch; }
+  .seq-acoes .btn { justify-content: center; }
+  .seq-acoes #seqPular { margin-right: 0; }
+}

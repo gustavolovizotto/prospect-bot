@@ -399,8 +399,12 @@ PROBLEMA_FRASE = {  # trecho do diagnóstico -> como falar disso com o cliente
 
 
 def nome_curto(nome):
-    """'Consultório X - Dra. Y | Lentes' -> 'Consultório X'"""
-    return re.split(r"\s+[-|–]\s+", nome or "")[0].strip() or nome
+    """'Consultório X - Dra. Y | Lentes' -> 'Consultório X'; pula partes só genéricas ('Consultório Dentista - Dra. Y' -> 'Dra. Y')"""
+    partes = [p.strip(" .") for p in re.split(r"\s+[-|–]\s+", nome or "") if p.strip(" .")]
+    for p in partes:
+        if any(w not in GENERICAS for w in re.findall(r"[a-z0-9]+", sem_acento(p))):
+            return p
+    return partes[0] if partes else nome
 
 
 def juntar(itens):
@@ -421,9 +425,11 @@ def mensagem(lead, perfil=None, hora=None):
     site = re.sub(r"^https?://(www\.)?|/$", "", lead.get("site") or "")
     seu_nome = (p.get("nome") or "").strip() or "[seu nome]"
     funcao = (p.get("funcao") or "").strip() or "desenvolvedor web"
+    if funcao.istitle():  # "Desenvolvedor Web" -> "desenvolvedor web" no meio da frase
+        funcao = funcao.lower()
 
     if diag == "sem site":
-        obs = f"Pesquisando por {nome} no Google, vi que vocês ainda não têm um site próprio, apenas o perfil no mapa."
+        obs = f"Pesquisando por {nome}, vi que vocês ainda não têm um site próprio."
     elif "rede social" in diag:
         obs = ("Vi que hoje o principal canal online de vocês é a rede social. Ela é ótima para relacionamento, "
                "mas não aparece bem nas buscas do Google e depende do alcance que o algoritmo libera.")
@@ -573,6 +579,9 @@ def demo():
     assert etapa_auto(rede) == "descartado" and motivo_auto(rede).startswith(MOTIVOS_AUTO)
     assert sum(x["pontos"] for x in quente["analise"]) == quente["score"]
     assert nome_curto("Consultório X - Dra. Y | Lentes") == "Consultório X"
+    assert nome_curto("Consultório Dentista - Dra. Debora Julietti - Lentes") == "Dra. Debora Julietti"
+    assert nome_curto(".Venturini Advogados Associados") == "Venturini Advogados Associados"
+    assert "sou desenvolvedor web e" in mensagem({"nome": "A", "nicho": "pet", "diagnostico": "sem site"}, {"funcao": "Desenvolvedor Web"})
     assert palavras("Navarro Odontologia") == (["navarro", "odontologia"], ["navarro"])
     assert juntar(["a"]) == "a" and juntar(["a", "b", "c"]) == "a, b e c"
     assert [saudacao(h) for h in (0, 5, 11, 12, 17, 18, 23)] == ["Boa noite", "Bom dia", "Bom dia", "Boa tarde", "Boa tarde", "Boa noite", "Boa noite"]
