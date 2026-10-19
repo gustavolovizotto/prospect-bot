@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Prospecção</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://unpkg.com/@phosphor-icons/web@2.1.1/src/regular/style.css">
+  <link rel="stylesheet" href="https://unpkg.com/@phosphor-icons/web@2.1.1/src/fill/style.css">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark"><i class="ph-fill ph-target"></i></div>
+        <div class="brand-text">
+          <strong>Prospecção</strong>
+          <span id="total">Carregando…</span>
+        </div>
+        <button class="icon-btn" id="tema" title="Alternar tema" aria-label="Alternar tema"><i class="ph ph-moon"></i></button>
+      </div>
+
+      <label class="search">
+        <i class="ph ph-magnifying-glass"></i>
+        <input type="search" id="busca" placeholder="Buscar empresa, telefone, endereço" autocomplete="off">
+      </label>
+
+      <div class="tabs" id="tabs" role="tablist"></div>
+
+      <div class="filters">
+        <label class="select"><select id="fNicho" aria-label="Nicho"></select><i class="ph ph-caret-down"></i></label>
+        <label class="select"><select id="fCidade" aria-label="Cidade"></select><i class="ph ph-caret-down"></i></label>
+        <label class="select"><select id="fEtapa" aria-label="Etapa"></select><i class="ph ph-caret-down"></i></label>
+      </div>
+
+      <ul class="list" id="lista" role="listbox" aria-label="Leads"></ul>
+    </aside>
+
+    <main class="detail" id="detalhe">
+      <div class="empty">
+        <i class="ph ph-cursor-click"></i>
+        <p>Selecione um lead para ver os detalhes</p>
+        <small>Use as setas do teclado para navegar</small>
+      </div>
+    </main>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="app.js"></script>
+</body>
+</html>

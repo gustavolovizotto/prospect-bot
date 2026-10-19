@@ -140,7 +140,10 @@ def qualificar(site, avaliacoes):
                 probs.append(f"copyright {m.group(1)}")
             s, d = 20 + 15 * len(probs), ", ".join(probs) or "site ok"
         except Exception as e:
-            s, d = 80, f"site fora do ar ({str(e)[:60]})"
+            e = str(e)
+            motivo = ("domínio não existe" if "(6)" in e else "não responde" if "(28)" in e or "(7)" in e
+                      else "certificado inválido" if "(60)" in e or "(35)" in e else e[:40])
+            s, d = 80, f"site fora do ar ({motivo})"
     if avaliacoes:  # negócio com movimento = paga
         s += min(10, avaliacoes // 20)
     return min(s, 100), d

@@ -10,6 +10,8 @@ where python >nul 2>nul || (
 set "CIDADES=%~1"
 if "%CIDADES%"=="" set /p "CIDADES=Cidades separadas por virgula [Campinas]: "
 if "%CIDADES%"=="" set "CIDADES=Campinas"
+start "Painel de leads" /min python -X utf8 painel.py
+timeout /t 2 >nul & start "" http://localhost:8765
 rem impede o PC de dormir enquanto a janela estiver aberta (volta ao normal ao fechar)
 powershell -NoProfile -Command "Add-Type -Name P -Namespace W -MemberDefinition '[DllImport(\"kernel32.dll\")]public static extern uint SetThreadExecutionState(uint e);'; [W.P]::SetThreadExecutionState(0x80000001) > $null; python -X utf8 -u bot.py --cidades '%CIDADES%' --loop 2>&1 | Tee-Object -Append run.log"
 pause

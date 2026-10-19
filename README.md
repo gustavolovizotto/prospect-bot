@@ -16,8 +16,17 @@ git clone <este repo> && cd <pasta>
 Sem cidades na linha de comando, o script pergunta. Ele impede o computador de dormir e repete a busca a cada 6h.
 Deixe o carregador ligado.
 
-De manhã, abra **`leads.csv`** no Excel: está ordenado por prioridade, e a coluna `link_whatsapp` abre a conversa
-com a mensagem já escrita.
+O script também abre o **painel em http://localhost:8765**. Nele os leads aparecem separados em quentes, mornos e frios,
+e cada lead mostra contato, site atual e diagnóstico, argumento de venda, o que propor na landing page e a mensagem
+(editável) com botão de WhatsApp, além da etapa do funil e de notas da negociação. Para abrir só o painel: `python3 painel.py`.
+
+## Estrutura
+
+- `bot.py` faz prospecção, qualificação e mensagem, e grava em `leads.db` (SQLite).
+- `painel.py` é o servidor local: API em `/api/leads` e `/api/lead`, mais o argumento de venda e a proposta por nicho.
+- `static/` é o front sem build: `index.html`, `app.css` (paleta em variáveis no topo) e `app.js`. Ícones: [Phosphor](https://phosphoricons.com).
+
+Se preferir planilha, `leads.csv` tem os mesmos dados ordenados por prioridade.
 
 ## Opções
 
