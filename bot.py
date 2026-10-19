@@ -5,40 +5,94 @@ Funil: 1) prospecção (OpenStreetMap ou Google Places) -> 2) qualificação (ch
        -> 3) abordagem (mensagem pronta + link wa.me). Você revisa e envia de manhã.
 
 Uso:
-  ./rodar.sh "Campinas,Sorocaba"   (Windows: rodar.bat)
+  ./rodar.sh   (Windows: rodar.bat)  -> abre o painel, de onde você inicia a prospecção
+  python3 bot.py --cidades "Campinas" --nichos dentista   # direto pela linha de comando
   python3 bot.py --export            # gera leads.csv ordenado por score
 """
 import argparse, csv, json, os, re, sqlite3, subprocess, sys, time, urllib.parse
 from datetime import datetime
 
 UA = "lp-prospector/0.1 (prospeccao local)"
-DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "leads.db")
+RAIZ = os.path.dirname(os.path.abspath(__file__))
+DB = os.path.join(RAIZ, "leads.db")
+CONFIG = os.path.join(RAIZ, "config.json")  # perfil do vendedor e chave do Google (local, fora do git)
 
-# nicho -> (filtro OSM, termo de busca Google)
+# Tudo que o funil sabe sobre cada nicho. Para adicionar um nicho, basta uma entrada aqui.
+#   osm: filtro Overpass · busca: termo no Google Places · rotulo: nome na tela
+#   segmento: "desenvolvo sites para ___" · publico/escolha/conversao: frase de valor da mensagem
+#   itens: o que o site mostra (mensagem) · proposta: seções sugeridas da landing (painel)
 NICHOS = {
-    "dentista": ('["amenity"="dentist"]', "dentista"),
-    "salao": ('["shop"~"hairdresser|beauty"]', "salão de beleza"),
-    "academia": ('["leisure"="fitness_centre"]', "academia"),
-    "advogado": ('["office"="lawyer"]', "escritório de advocacia"),
-    "contador": ('["office"="accountant"]', "contabilidade"),
-    "veterinario": ('["amenity"="veterinary"]', "clínica veterinária"),
-    "fisioterapia": ('["healthcare"="physiotherapist"]', "fisioterapia"),
-    "clinica": ('["amenity"="clinic"]', "clínica"),
-    "oficina": ('["shop"="car_repair"]', "oficina mecânica"),
-    "restaurante": ('["amenity"="restaurant"]', "restaurante"),
-    "padaria": ('["shop"="bakery"]', "padaria"),
-    "pet": ('["shop"="pet"]', "pet shop"),
+    "dentista": dict(osm='["amenity"="dentist"]', busca="dentista", rotulo="Dentista",
+                     segmento="clínicas odontológicas", publico="pacientes", escolha="um dentista", conversao="consultas agendadas",
+                     itens="os tratamentos, os convênios aceitos e o agendamento direto pelo WhatsApp",
+                     proposta=["Tratamentos com fotos de antes e depois", "Convênios aceitos", "Agendamento pelo WhatsApp", "Avaliações do Google", "Mapa e horários"]),
+    "salao": dict(osm='["shop"~"hairdresser|beauty"]', busca="salão de beleza", rotulo="Salão de beleza",
+                  segmento="salões e estúdios de beleza", publico="clientes", escolha="um salão", conversao="horários marcados",
+                  itens="os serviços, fotos dos trabalhos e o agendamento pelo WhatsApp",
+                  proposta=["Galeria de trabalhos", "Serviços e preços", "Agendamento pelo WhatsApp", "Link do Instagram", "Horários"]),
+    "academia": dict(osm='["leisure"="fitness_centre"]', busca="academia", rotulo="Academia",
+                     segmento="academias e estúdios", publico="alunos", escolha="onde treinar", conversao="matrículas",
+                     itens="os planos, a grade de aulas e um botão para agendar a aula experimental",
+                     proposta=["Planos e preços", "Grade de aulas", "Fotos da estrutura", "Aula experimental grátis"]),
+    "advogado": dict(osm='["office"="lawyer"]', busca="escritório de advocacia", rotulo="Advocacia",
+                     segmento="escritórios de advocacia", publico="clientes", escolha="um advogado", conversao="consultas",
+                     itens="as áreas de atuação, a apresentação do escritório e um canal de contato discreto",
+                     proposta=["Áreas de atuação", "Sobre o advogado (OAB)", "Perguntas frequentes", "Contato discreto por formulário e WhatsApp"]),
+    "contador": dict(osm='["office"="accountant"]', busca="contabilidade", rotulo="Contabilidade",
+                     segmento="escritórios de contabilidade", publico="empresários", escolha="um contador", conversao="pedidos de orçamento",
+                     itens="os serviços para MEI e empresas e um formulário de orçamento",
+                     proposta=["Serviços para MEI e empresas", "Abertura de empresa", "Formulário de orçamento", "Depoimentos de clientes"]),
+    "veterinario": dict(osm='["amenity"="veterinary"]', busca="clínica veterinária", rotulo="Veterinário",
+                        segmento="clínicas veterinárias", publico="tutores", escolha="uma clínica para o pet", conversao="atendimentos agendados",
+                        itens="as especialidades, o atendimento de emergência e o agendamento pelo WhatsApp",
+                        proposta=["Serviços e especialidades", "Emergência em destaque", "Agendamento pelo WhatsApp", "Mapa"]),
+    "fisioterapia": dict(osm='["healthcare"="physiotherapist"]', busca="fisioterapia", rotulo="Fisioterapia",
+                         segmento="clínicas de fisioterapia", publico="pacientes", escolha="uma clínica", conversao="sessões agendadas",
+                         itens="os tratamentos, os convênios e o agendamento pelo WhatsApp",
+                         proposta=["Tratamentos", "Convênios", "Equipe", "Agendamento pelo WhatsApp", "Depoimentos"]),
+    "clinica": dict(osm='["amenity"="clinic"]', busca="clínica", rotulo="Clínica",
+                    segmento="clínicas", publico="pacientes", escolha="uma clínica", conversao="consultas agendadas",
+                    itens="as especialidades, os convênios e o agendamento pelo WhatsApp",
+                    proposta=["Especialidades e médicos", "Convênios", "Agendamento pelo WhatsApp", "Localização e horários"]),
+    "oficina": dict(osm='["shop"="car_repair"]', busca="oficina mecânica", rotulo="Oficina mecânica",
+                    segmento="oficinas mecânicas", publico="motoristas", escolha="uma oficina", conversao="pedidos de orçamento",
+                    itens="os serviços, as marcas atendidas e o orçamento rápido pelo WhatsApp",
+                    proposta=["Serviços e marcas atendidas", "Orçamento por WhatsApp com foto", "Mapa e horários"]),
+    "restaurante": dict(osm='["amenity"="restaurant"]', busca="restaurante", rotulo="Restaurante",
+                        segmento="restaurantes", publico="clientes", escolha="onde comer", conversao="pedidos e reservas",
+                        itens="o cardápio com fotos, as reservas e o pedido pelo WhatsApp",
+                        proposta=["Cardápio com fotos", "Pedido e delivery", "Reservas pelo WhatsApp", "Horários e mapa"]),
+    "padaria": dict(osm='["shop"="bakery"]', busca="padaria", rotulo="Padaria",
+                    segmento="padarias e confeitarias", publico="clientes", escolha="onde encomendar", conversao="encomendas",
+                    itens="os produtos, as encomendas para festas e o pedido pelo WhatsApp",
+                    proposta=["Produtos e encomendas para festa", "Pedido pelo WhatsApp", "Horários e mapa"]),
+    "pet": dict(osm='["shop"="pet"]', busca="pet shop", rotulo="Pet shop",
+                segmento="pet shops", publico="tutores", escolha="um pet shop", conversao="agendamentos de banho e tosa",
+                itens="os serviços de banho e tosa, o leva e traz e o agendamento pelo WhatsApp",
+                proposta=["Banho e tosa com agendamento", "Produtos", "Leva e traz", "WhatsApp e mapa"]),
 }
 SOCIAL = ("instagram.com", "facebook.com", "linktr.ee", "wa.me", "whatsapp.com", "tiktok.com", "linkedin.com")
 
 
 def db():
-    c = sqlite3.connect(DB)
+    c = sqlite3.connect(DB, timeout=15)  # bot e painel escrevem no mesmo arquivo
     c.execute("""CREATE TABLE IF NOT EXISTS leads(
         id TEXT PRIMARY KEY, nome TEXT, nicho TEXT, cidade TEXT, endereco TEXT, telefone TEXT,
         site TEXT, avaliacoes INTEGER, fonte TEXT, etapa TEXT DEFAULT 'prospectado',
         score INTEGER, diagnostico TEXT, mensagem TEXT, link_whatsapp TEXT, criado TEXT)""")
+    cols = [r[1] for r in c.execute("PRAGMA table_info(leads)")]
+    for col in ("notas", "motivo"):
+        if col not in cols:
+            c.execute(f"ALTER TABLE leads ADD COLUMN {col} TEXT")
     return c
+
+
+def carregar_config():
+    try:
+        with open(CONFIG, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
 
 
 def http(url, data=None, headers=None, timeout=30):
@@ -76,7 +130,8 @@ def retry(fn, tentativas=4):
 # ---------- 1) prospecção ----------
 def buscar_osm(cidade, nicho):
     # ponytail: casa qualquer área com esse nome (ex.: bairro "Campinas" em SC); filtrar por DDD se incomodar
-    filtro = NICHOS[nicho][0]
+    filtro = NICHOS[nicho]["osm"]
+    cidade = cidade.replace('"', "").replace("\\", "")
     q = (f'[out:json][timeout:120];area["name"="{cidade}"]["boundary"="administrative"]->.a;'
          f'nwr{filtro}["name"](area.a);out tags center;')
     r = retry(lambda: json.loads(http("https://overpass-api.de/api/interpreter",
@@ -95,7 +150,7 @@ def buscar_google(cidade, nicho, key):
               "places.websiteUri,places.userRatingCount,places.businessStatus,nextPageToken")
     token = None
     for _ in range(3):  # API devolve no máx. 60 resultados (3 páginas de 20)
-        body = {"textQuery": f"{NICHOS[nicho][1]} em {cidade}", "languageCode": "pt-BR"}
+        body = {"textQuery": f"{NICHOS[nicho]['busca']} em {cidade}", "languageCode": "pt-BR"}
         if token:
             body["pageToken"] = token
         r = retry(lambda: json.loads(http("https://places.googleapis.com/v1/places:searchText",
@@ -150,21 +205,69 @@ def qualificar(site, avaliacoes):
 
 
 # ---------- 3) abordagem ----------
-def mensagem(nome, diag):
+PROBLEMA_FRASE = {  # trecho do diagnóstico -> como falar disso com o cliente
+    "sem https": "aparece como “Não seguro” no navegador",
+    "não é mobile": "não se adapta bem à tela do celular",
+    "lento": "demora para carregar",
+    "quase sem conteúdo": "traz pouca informação sobre os serviços",
+    "copyright": "passa a impressão de estar desatualizado",
+}
+
+
+def nome_curto(nome):
+    """'Consultório X - Dra. Y | Lentes' -> 'Consultório X'"""
+    return re.split(r"\s+[-|–]\s+", nome or "")[0].strip() or nome
+
+
+def juntar(itens):
+    return itens[0] if len(itens) == 1 else ", ".join(itens[:-1]) + " e " + itens[-1]
+
+
+def saudacao(hora=None):
+    h = datetime.now().hour if hora is None else hora
+    return "Bom dia" if 5 <= h < 12 else "Boa tarde" if 12 <= h < 18 else "Boa noite"
+
+
+def mensagem(lead, perfil=None, hora=None):
+    """Mensagem de primeiro contato: apresentação, observação concreta, valor para o nicho, convite leve."""
+    p = perfil or {}
+    n = NICHOS.get(lead.get("nicho"), NICHOS["clinica"])
+    diag = lead.get("diagnostico") or ""
+    nome = nome_curto(lead.get("nome"))
+    site = re.sub(r"^https?://(www\.)?|/$", "", lead.get("site") or "")
+    seu_nome = (p.get("nome") or "").strip() or "[seu nome]"
+    funcao = (p.get("funcao") or "").strip() or "desenvolvedor web"
+
     if diag == "sem site":
-        gancho = f"vi a {nome} no mapa e reparei que vocês ainda não têm um site"
+        obs = f"Pesquisando por {nome} no Google, vi que vocês ainda não têm um site próprio, apenas o perfil no mapa."
     elif "rede social" in diag:
-        gancho = f"vi que a {nome} usa o Instagram como site principal"
+        obs = ("Vi que hoje o principal canal online de vocês é a rede social. Ela é ótima para relacionamento, "
+               "mas não aparece bem nas buscas do Google e depende do alcance que o algoritmo libera.")
     elif "fora do ar" in diag:
-        gancho = f"tentei abrir o site da {nome} e ele não carregou"
-    elif diag == "site ok":
-        gancho = f"dei uma olhada no site da {nome}"
+        obs = (f"Tentei acessar o site de vocês ({site}) e ele não está carregando. Enquanto isso, "
+               "quem procura por vocês no Google encontra uma página de erro.")
     else:
-        gancho = f"dei uma olhada no site da {nome} e notei: {diag}"
-    return (f"Olá! Tudo bem? {gancho[0].upper() + gancho[1:]}. "
-            "Eu faço landing pages simples e rápidas (celular, WhatsApp, Google Maps, formulário) "
-            "pra negócios locais trazerem mais clientes. Posso te mandar um modelo de como ficaria a de vocês, sem compromisso? "
-            "Se não fizer sentido é só me avisar que não mando mais mensagem.")
+        frases = [f for k, f in PROBLEMA_FRASE.items() if k in diag]
+        obs = (f"Acessei o site de vocês ({site}) e notei que ele {juntar(frases)}, pontos que costumam afastar visitantes."
+               if frases else
+               f"Acessei o site de vocês ({site}) e vi que já existe uma boa base. Trabalho também com melhorias "
+               "pontuais de conversão, como WhatsApp em destaque e páginas específicas por serviço.")
+
+    valor = (f"Hoje a maioria dos {n['publico']} pesquisa no Google antes de escolher {n['escolha']}. "
+             f"Um site objetivo, com {n['itens']}, ajuda a transformar essas buscas em {n['conversao']}.")
+    assinatura = seu_nome + (f"\n{p['portfolio'].strip()}" if (p.get("portfolio") or "").strip() else "")
+
+    return (f"{saudacao(hora)}, tudo bem? Meu nome é {seu_nome}, sou {funcao} e trabalho com sites para "
+            f"{n['segmento']} aqui da região.\n\n{obs}\n\n{valor}\n\n"
+            "Posso montar uma proposta enxuta para o caso de vocês e enviar por aqui, sem compromisso?\n\n"
+            f"Se não for o momento, sem problema. Agradeço a atenção.\n{assinatura}")
+
+
+def motivo_auto(diag, score):
+    """Por que o bot descartou (score < 50)."""
+    if diag == "site ok":
+        return "O site atual está em ordem: tem HTTPS, funciona no celular, carrega rápido e tem conteúdo. Baixa chance de troca."
+    return f"Site com problemas leves ({diag}). A dor não justifica uma abordagem agora (score {score})."
 
 
 def link_whatsapp(tel, msg):
@@ -185,24 +288,31 @@ def log(msg):
 
 def rodada(c, cidades, nichos):
     key = os.environ.get("GOOGLE_PLACES_KEY")
+    perfil = carregar_config().get("perfil", {})
+    total, i = len(cidades) * len(nichos), 0
     for cidade in cidades:
         for nicho in nichos:
-            log(f"{cidade} / {nicho} via {'google' if key else 'osm'}")
+            i += 1
+            log(f"Buscando {i}/{total}: {cidade} · {NICHOS[nicho]['rotulo']} ({'Google' if key else 'OpenStreetMap'})")
             novos = 0
             achados = buscar_google(cidade, nicho, key) if key else buscar_osm(cidade, nicho)
             for lead in achados:
                 if c.execute("SELECT 1 FROM leads WHERE id=?", (lead["id"],)).fetchone():
                     continue
                 score, diag = qualificar(lead["site"], lead["avaliacoes"])
-                msg = mensagem(lead["nome"], diag)
+                lead.update(nicho=nicho, cidade=cidade, score=score, diagnostico=diag)
+                msg = mensagem(lead, perfil)
                 wa = link_whatsapp(lead["telefone"], msg)
                 etapa = "abordagem_pronta" if wa and score >= 50 else ("qualificado" if score >= 50 else "descartado")
-                c.execute("INSERT INTO leads VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                c.execute("""INSERT INTO leads(id, nome, nicho, cidade, endereco, telefone, site, avaliacoes, fonte, etapa,
+                             score, diagnostico, mensagem, link_whatsapp, criado, motivo)
+                             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                           (lead["id"], lead["nome"], nicho, cidade, lead["endereco"], lead["telefone"], lead["site"],
-                           lead["avaliacoes"], lead["fonte"], etapa, score, diag, msg, wa, datetime.now().isoformat()))
+                           lead["avaliacoes"], lead["fonte"], etapa, score, diag, msg, wa, datetime.now().isoformat(),
+                           motivo_auto(diag, score) if etapa == "descartado" else None))
                 c.commit()
                 novos += 1
-            log(f"  +{novos} leads")
+            log(f"  +{novos} leads novos")
             time.sleep(5 if key else 15)  # ponytail: rate limit fixo; Overpass é público e compartilhado
 
 
@@ -223,6 +333,15 @@ def demo():
     assert link_whatsapp("123", "x") is None and link_whatsapp(None, "x") is None
     assert qualificar(None, None) == (90, "sem site")
     assert qualificar("https://instagram.com/x", 400)[0] == 95
+    assert nome_curto("Consultório X - Dra. Y | Lentes") == "Consultório X"
+    assert [saudacao(h) for h in (0, 5, 11, 12, 17, 18, 23)] == ["Boa noite", "Bom dia", "Bom dia", "Boa tarde", "Boa tarde", "Boa noite", "Boa noite"]
+    assert juntar(["a"]) == "a" and juntar(["a", "b", "c"]) == "a, b e c"
+    m = mensagem({"nome": "Oralcamp", "nicho": "dentista", "diagnostico": "sem https, não é mobile", "site": "https://www.x.com.br/"},
+                 {"nome": "Gustavo", "portfolio": "gustavo.dev"}, hora=9)
+    assert m.startswith("Bom dia") and "Gustavo" in m and "(x.com.br)" in m and "“Não seguro” no navegador e não se adapta" in m, m
+    assert "[seu nome]" in mensagem({"nome": "A", "nicho": "pet", "diagnostico": "sem site"})
+    for k, n in NICHOS.items():  # toda entrada precisa dos campos usados na mensagem
+        assert {"osm", "busca", "rotulo", "segmento", "publico", "escolha", "conversao", "itens", "proposta"} <= n.keys(), k
     print("ok")
 
 

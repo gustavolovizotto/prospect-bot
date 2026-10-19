@@ -1,35 +1,28 @@
 #!/usr/bin/env python3
-"""Painel local dos leads: python3 painel.py  ->  http://localhost:8765
+"""Painel local: python3 painel.py  ->  http://localhost:8765
 
-Servidor só-stdlib. O front fica em static/ (index.html, app.css, app.js).
+Servidor só-stdlib. Front em static/ (index.html, app.css, app.js).
 API:
-  GET  /api/leads  -> {"leads": [...], "etapas": [...]}
-  POST /api/lead   <- {"id", "etapa", "notas"}
+  GET  /api/leads          -> {"leads", "etapas", "motivos"}
+  POST /api/lead           <- {"id", "etapa", "notas", "motivo"}
+  GET  /api/bot            -> estado da prospecção (rodando, progresso, log) + nichos
+  POST /api/bot/iniciar    <- {"cidades": [...], "nichos": [...], "fonte": "osm"|"google", "loop": bool}
+  POST /api/bot/parar
+  GET  /api/config         -> {"perfil", "tem_google_key"}
+  POST /api/config         <- {"perfil": {...}, "google_key"?: str}
 """
-import json, mimetypes, os, sqlite3, sys
+import atexit, json, mimetypes, os, re, sqlite3, subprocess, sys, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-RAIZ = os.path.dirname(os.path.abspath(__file__))
-DB = os.path.join(RAIZ, "leads.db")
+import bot
+
+RAIZ = bot.RAIZ
 STATIC = os.path.join(RAIZ, "static")
+LOG = os.path.join(RAIZ, "run.log")
 PORTA = int(os.environ.get("PORTA", 8765))
 ETAPAS = ["abordagem_pronta", "qualificado", "contatado", "respondeu", "negociando", "fechado", "perdido", "descartado"]
-
-# seções que fazem sentido na landing de cada nicho
-PROPOSTA = {
-    "dentista": ["Tratamentos com fotos de antes e depois", "Convênios aceitos", "Agendamento pelo WhatsApp", "Avaliações do Google", "Mapa e horários"],
-    "salao": ["Galeria de trabalhos", "Serviços e preços", "Agendamento pelo WhatsApp", "Link do Instagram", "Horários"],
-    "academia": ["Planos e preços", "Grade de aulas", "Fotos da estrutura", "Aula experimental grátis"],
-    "advogado": ["Áreas de atuação", "Sobre o advogado (OAB)", "Perguntas frequentes", "Contato discreto por formulário e WhatsApp"],
-    "contador": ["Serviços para MEI e empresas", "Abertura de empresa", "Formulário de orçamento", "Depoimentos de clientes"],
-    "veterinario": ["Serviços e especialidades", "Emergência em destaque", "Agendamento pelo WhatsApp", "Mapa"],
-    "fisioterapia": ["Tratamentos", "Convênios", "Equipe", "Agendamento pelo WhatsApp", "Depoimentos"],
-    "clinica": ["Especialidades e médicos", "Convênios", "Agendamento pelo WhatsApp", "Localização e horários"],
-    "oficina": ["Serviços e marcas atendidas", "Orçamento por WhatsApp com foto", "Mapa e horários"],
-    "restaurante": ["Cardápio com fotos", "Pedido e delivery", "Reservas pelo WhatsApp", "Horários e mapa"],
-    "padaria": ["Produtos e encomendas para festa", "Pedido pelo WhatsApp", "Horários e mapa"],
-    "pet": ["Banho e tosa com agendamento", "Produtos", "Leva e traz", "WhatsApp e mapa"],
-}
+MOTIVOS = ["Já tem site e está satisfeito", "Sem interesse", "Sem orçamento agora", "Contato inválido",
+           "Fechou com outro", "Não respondeu"]
 
 # problema no diagnóstico -> (ícone Phosphor, por que importa)
 PROBLEMAS = {
@@ -65,29 +58,105 @@ def argumento(diag):
             "problemas": probs}
 
 
-def db():
-    c = sqlite3.connect(DB)
-    c.row_factory = sqlite3.Row
-    if "notas" not in [r[1] for r in c.execute("PRAGMA table_info(leads)")]:
-        c.execute("ALTER TABLE leads ADD COLUMN notas TEXT")
-    return c
-
-
 def leads():
-    if not os.path.exists(DB):
+    if not os.path.exists(bot.DB):
         return []
-    with db() as c:
+    perfil = bot.carregar_config().get("perfil", {})
+    with bot.db() as c:
+        c.row_factory = sqlite3.Row
         rows = [dict(r) for r in c.execute(
             "SELECT * FROM leads ORDER BY score DESC, (link_whatsapp IS NULL), avaliacoes DESC")]
     for r in rows:
-        r["argumento"] = argumento(r["diagnostico"] or "")
-        r["proposta"] = PROPOSTA.get(r["nicho"], [])
+        diag = r["diagnostico"] or ""
+        r["argumento"] = argumento(diag)
+        r["proposta"] = bot.NICHOS.get(r["nicho"], {}).get("proposta", [])
+        r["mensagem"] = bot.mensagem(r, perfil)  # sempre com o perfil atual
+        if r["etapa"] == "descartado" and not r["motivo"]:  # leads antigos, de antes da coluna motivo
+            r["motivo"] = bot.motivo_auto(diag, r["score"])
     return rows
 
 
+# ---------- processo do bot ----------
+BOT = {"proc": None, "params": None, "inicio": None}
+
+
+def estado_bot():
+    p = BOT["proc"]
+    rodando = bool(p and p.poll() is None)
+    linhas = []
+    if BOT["inicio"] and os.path.exists(LOG):
+        with open(LOG, encoding="utf-8", errors="ignore") as f:
+            linhas = f.read().splitlines()
+    feitos = [m for m in (re.search(r"Buscando (\d+)/(\d+): (.+)", l) for l in linhas) if m]
+    novos = sum(int(m.group(1)) for m in (re.search(r"\+(\d+) leads", l) for l in linhas) if m)
+    ultimo = feitos[-1] if feitos else None
+    return {
+        "rodando": rodando,
+        "status": "rodando" if rodando else ("concluido" if p and p.returncode == 0 else "parado" if p else "ocioso"),
+        "aguardando": rodando and bool(linhas) and "dormindo" in linhas[-1],
+        "params": BOT["params"],
+        "inicio": BOT["inicio"],
+        "atual": int(ultimo.group(1)) if ultimo else 0,
+        "total": int(ultimo.group(2)) if ultimo else len((BOT["params"] or {}).get("cidades", [])) * len((BOT["params"] or {}).get("nichos", [])),
+        "etapa": ultimo.group(3) if ultimo else "",
+        "novos": novos,
+        "avisos": sum("falhou" in l for l in linhas),
+        "log": linhas[-40:],
+        "nichos": [{"id": k, "rotulo": v["rotulo"]} for k, v in bot.NICHOS.items()],
+    }
+
+
+def iniciar_bot(d):
+    if BOT["proc"] and BOT["proc"].poll() is None:
+        raise ValueError("A prospecção já está rodando.")
+    cidades = [c.strip() for c in d.get("cidades", []) if isinstance(c, str) and c.strip()]
+    nichos = [n for n in d.get("nichos", []) if n in bot.NICHOS]
+    if not cidades or any(re.search(r'["\\,]', c) or len(c) > 60 for c in cidades):
+        raise ValueError("Informe ao menos uma cidade válida.")
+    if not nichos:
+        raise ValueError("Escolha ao menos um nicho.")
+    env = {k: v for k, v in os.environ.items() if k != "GOOGLE_PLACES_KEY"}
+    if d.get("fonte") == "google":
+        key = bot.carregar_config().get("google_key")
+        if not key:
+            raise ValueError("Salve a chave do Google Places antes de usar essa fonte.")
+        env["GOOGLE_PLACES_KEY"] = key
+    cmd = [sys.executable, "-u", "-X", "utf8", os.path.join(RAIZ, "bot.py"),
+           "--cidades", ",".join(cidades), "--nichos", ",".join(nichos)] + (["--loop"] if d.get("loop") else [])
+    saida = open(LOG, "w", encoding="utf-8")
+    BOT.update(proc=subprocess.Popen(cmd, stdout=saida, stderr=subprocess.STDOUT, env=env, cwd=RAIZ),
+               params={"cidades": cidades, "nichos": nichos, "fonte": d.get("fonte", "osm"), "loop": bool(d.get("loop"))},
+               inicio=time.time())
+
+
+def parar_bot():
+    p = BOT["proc"]
+    if p and p.poll() is None:
+        p.terminate()
+        try:
+            p.wait(5)
+        except subprocess.TimeoutExpired:
+            p.kill()
+
+
+atexit.register(parar_bot)
+
+
+def salvar_config(d):
+    cfg = bot.carregar_config()
+    perfil = d.get("perfil")
+    if isinstance(perfil, dict):
+        cfg["perfil"] = {k: str(perfil.get(k, ""))[:200] for k in ("nome", "funcao", "portfolio")}
+    if isinstance(d.get("google_key"), str):
+        cfg["google_key"] = d["google_key"].strip()
+    with open(bot.CONFIG, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+# ---------- HTTP ----------
 class H(BaseHTTPRequestHandler):
     def responder(self, corpo, tipo="application/json; charset=utf-8", status=200):
-        b = corpo if isinstance(corpo, bytes) else corpo.encode()
+        b = corpo if isinstance(corpo, bytes) else (corpo if isinstance(corpo, str) else json.dumps(corpo, ensure_ascii=False)).encode()
         self.send_response(status)
         self.send_header("Content-Type", tipo)
         self.send_header("Content-Length", str(len(b)))
@@ -95,28 +164,54 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
+    def erro(self, msg, status=400):
+        self.responder({"erro": msg}, status=status)
+
+    def corpo(self):
+        return json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+
     def do_GET(self):
         if self.path == "/api/leads":
-            return self.responder(json.dumps({"leads": leads(), "etapas": ETAPAS}, ensure_ascii=False))
+            return self.responder({"leads": leads(), "etapas": ETAPAS, "motivos": MOTIVOS})
+        if self.path == "/api/bot":
+            return self.responder(estado_bot())
+        if self.path == "/api/config":
+            cfg = bot.carregar_config()
+            return self.responder({"perfil": cfg.get("perfil", {}), "tem_google_key": bool(cfg.get("google_key"))})
         nome = "index.html" if self.path == "/" else self.path.lstrip("/").split("?")[0]
         arq = os.path.realpath(os.path.join(STATIC, nome))
         if not arq.startswith(STATIC + os.sep) or not os.path.isfile(arq):  # bloqueia ../
-            return self.responder('{"erro":"não encontrado"}', status=404)
+            return self.erro("não encontrado", 404)
         tipo = (mimetypes.guess_type(arq)[0] or "application/octet-stream") + "; charset=utf-8"
         with open(arq, "rb") as f:
             self.responder(f.read(), tipo)
 
     def do_POST(self):
-        if self.path != "/api/lead":
-            return self.responder('{"erro":"não encontrado"}', status=404)
         try:
-            d = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
-            assert d.get("etapa") in ETAPAS and isinstance(d.get("notas", ""), str) and isinstance(d.get("id"), str)
+            d = self.corpo()
+            assert isinstance(d, dict)
         except Exception:
-            return self.responder('{"erro":"dados inválidos"}', status=400)
-        with db() as c:
-            n = c.execute("UPDATE leads SET etapa=?, notas=? WHERE id=?", (d["etapa"], d.get("notas", ""), d["id"])).rowcount
-        self.responder(json.dumps({"ok": bool(n)}), status=200 if n else 404)
+            return self.erro("JSON inválido")
+        try:
+            if self.path == "/api/lead":
+                if d.get("etapa") not in ETAPAS or not isinstance(d.get("id"), str):
+                    return self.erro("dados inválidos")
+                with bot.db() as c:
+                    n = c.execute("UPDATE leads SET etapa=?, notas=?, motivo=? WHERE id=?",
+                                  (d["etapa"], str(d.get("notas") or ""), str(d.get("motivo") or "") or None, d["id"])).rowcount
+                return self.responder({"ok": bool(n)}, status=200 if n else 404)
+            if self.path == "/api/bot/iniciar":
+                iniciar_bot(d)
+                return self.responder(estado_bot())
+            if self.path == "/api/bot/parar":
+                parar_bot()
+                return self.responder(estado_bot())
+            if self.path == "/api/config":
+                salvar_config(d)
+                return self.responder({"ok": True})
+        except ValueError as e:
+            return self.erro(str(e))
+        self.erro("não encontrado", 404)
 
     def log_message(self, *a):
         pass
@@ -128,6 +223,12 @@ def demo():
     assert argumento("lento (6s)")["problemas"][0]["texto"] == "Lento (6s)"
     assert argumento("site ok")["problemas"] == []
     assert argumento("site fora do ar (domínio não existe)")["problemas"][0]["icone"] == "link-break"
+    for ruim in ([], ["Campinas\""], ["a,b"]):
+        try:
+            iniciar_bot({"cidades": ruim, "nichos": ["dentista"]})
+            raise AssertionError(ruim)
+        except ValueError:
+            pass
     print("ok")
 
 

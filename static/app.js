@@ -1,4 +1,4 @@
-// Painel de leads. Sem build, sem dependências: dados vêm de /api/leads (painel.py).
+// Painel de prospecção. Sem build, sem dependências: dados vêm da API do painel.py.
 
 const ETAPA_NOME = {
   abordagem_pronta: "Pronto para abordar",
@@ -10,24 +10,34 @@ const ETAPA_NOME = {
   perdido: "Perdido",
   descartado: "Descartado",
 };
+const FORA_DO_FUNIL = ["descartado", "perdido"];
 const TEMPS = [
   ["quente", "Quentes"],
   ["morno", "Mornos"],
   ["frio", "Frios"],
   ["", "Todos"],
 ];
+const TEMP_NOME = { quente: "Quente", morno: "Morno", frio: "Frio" };
 
-const estado = { leads: [], etapas: [], temp: "quente", sel: null };
+const estado = {
+  leads: [], etapas: [], motivos: [],
+  temp: "quente", sel: null, view: "vazio",       // view: vazio | lead | run
+  bot: null, perfil: {}, temKey: false,
+  form: { cidades: [], nichos: [], fonte: "osm", loop: false },
+};
 const $ = (s) => document.querySelector(s);
 
 // ---------- utilidades ----------
 const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 const temperatura = (l) => (l.score >= 80 ? "quente" : l.score >= 50 ? "morno" : "frio");
-const TEMP_NOME = { quente: "Quente", morno: "Morno", frio: "Frio" };
-const nicho = (n) => ({ salao: "Salão de beleza", veterinario: "Veterinário", pet: "Pet shop" })[n] || n.charAt(0).toUpperCase() + n.slice(1);
+const nicho = (id) => estado.bot?.nichos.find((n) => n.id === id)?.rotulo || id.charAt(0).toUpperCase() + id.slice(1);
 const urlSite = (s) => (!s ? "" : /^https?:\/\//i.test(s) ? s : "http://" + s);
-const hostSite = (s) => s.replace(/^https?:\/\//i, "").replace(/\/$/, "");
+const hostSite = (s) => s.replace(/^https?:\/\/(www\.)?/i, "").replace(/\/$/, "");
+const duracao = (seg) => {
+  const m = Math.round(seg / 60);
+  return m < 1 ? "menos de 1 min" : m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${m % 60} min`;
+};
 function foneWhats(l) {
   let d = (l.telefone || "").replace(/\D/g, "");
   if (!d) return "";
@@ -40,7 +50,7 @@ function toast(texto, icone = "check-circle") {
   t.innerHTML = `<i class="ph-fill ph-${icone}"></i>${esc(texto)}`;
   t.classList.add("on");
   clearTimeout(toast.t);
-  toast.t = setTimeout(() => t.classList.remove("on"), 1800);
+  toast.t = setTimeout(() => t.classList.remove("on"), 2200);
 }
 
 const guardar = {
@@ -48,25 +58,28 @@ const guardar = {
   set: (k, v) => { try { localStorage.setItem(k, v); } catch {} },
 };
 
+async function api(caminho, corpo) {
+  const r = await fetch(caminho, corpo === undefined ? {} : {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(corpo),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.erro || "Erro inesperado");
+  return d;
+}
+
 // ---------- dados ----------
-async function carregar() {
-  const r = await fetch("/api/leads");
-  const d = await r.json();
+async function carregarLeads() {
+  const d = await api("/api/leads");
   estado.leads = d.leads;
   estado.etapas = d.etapas;
+  estado.motivos = d.motivos;
   $("#total").textContent = `${d.leads.length} leads encontrados`;
   preencherFiltros();
   renderLista();
 }
 
-async function salvar(l, mudancas) {
-  const corpo = { id: l.id, etapa: l.etapa, notas: l.notas || "", ...mudancas };
-  const r = await fetch("/api/lead", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(corpo),
-  });
-  if (!r.ok) throw new Error("falha ao salvar");
+async function salvarLead(l, mudancas) {
+  await api("/api/lead", { id: l.id, etapa: l.etapa, notas: l.notas || "", motivo: l.motivo || "", ...mudancas });
   Object.assign(l, mudancas);
 }
 
@@ -109,29 +122,44 @@ function renderLista() {
   const lista = filtrados();
   $("#lista").innerHTML = lista.length
     ? lista.map((l) => `
-      <li class="lead" role="option" data-id="${esc(l.id)}" aria-selected="${estado.sel === l.id}">
+      <li class="lead" role="option" data-id="${esc(l.id)}" aria-selected="${estado.view === "lead" && estado.sel === l.id}">
         <span class="nome">${esc(l.nome)}</span>
         <span class="meta">
           <span>${esc(nicho(l.nicho))} · ${esc(l.cidade)}</span>
-          ${!["abordagem_pronta", "qualificado", "descartado"].includes(l.etapa) ? `<span class="etapa-mini">${esc(ETAPA_NOME[l.etapa])}</span>` : ""}
+          ${!["abordagem_pronta", "qualificado"].includes(l.etapa)
+            ? `<span class="etapa-mini ${FORA_DO_FUNIL.includes(l.etapa) ? "fora" : ""}">${esc(ETAPA_NOME[l.etapa])}</span>` : ""}
         </span>
         <span class="score"><span class="dot ${temperatura(l)}"></span>${l.score}</span>
       </li>`).join("")
-    : `<li class="vazio">${estado.leads.length ? "Nenhum lead com esses filtros" : "Nenhum lead ainda. Deixe o bot rodar."}</li>`;
+    : `<li class="vazio">${estado.leads.length ? "Nenhum lead com esses filtros" : "Nenhum lead ainda. Comece uma nova prospecção."}</li>`;
 }
 
-// ---------- detalhe ----------
-function renderDetalhe(l) {
+function renderStatusSidebar() {
+  const b = estado.bot;
+  const btn = $("#abrirRun");
+  btn.classList.toggle("ativo", estado.view === "run");
+  btn.classList.toggle("rodando", !!b?.rodando);
+  $("#runStatus").textContent = !b ? "Defina cidades e nichos"
+    : b.aguardando ? `Aguardando próxima rodada · ${b.novos} novos`
+    : b.rodando ? `Buscando ${b.atual} de ${b.total} · ${b.novos} novos`
+    : b.status === "concluido" ? `Concluída · ${b.novos} leads novos`
+    : b.status === "parado" ? "Interrompida" : "Defina cidades e nichos";
+  btn.querySelector(".run-ico i").className = b?.rodando && !b.aguardando ? "ph ph-circle-notch girando" : "ph ph-rocket-launch";
+}
+
+// ---------- detalhe do lead ----------
+function renderLead(l) {
   const t = temperatura(l);
   const fone = foneWhats(l);
   const a = l.argumento;
+  const fora = FORA_DO_FUNIL.includes(l.etapa);
   const maps = "https://www.google.com/maps/search/?api=1&query=" + encodeURIComponent(`${l.nome} ${l.endereco || ""} ${l.cidade}`);
   const google = "https://www.google.com/search?q=" + encodeURIComponent(`${l.nome} ${l.cidade}`);
   const site = urlSite(l.site);
 
   $("#detalhe").innerHTML = `
   <div class="wrap">
-    <button class="btn voltar" id="voltar"><i class="ph ph-arrow-left"></i>Leads</button>
+    <button class="btn voltar" data-voltar><i class="ph ph-arrow-left"></i>Leads</button>
 
     <div class="head">
       <div>
@@ -150,6 +178,16 @@ function renderDetalhe(l) {
         </select><i class="ph ph-caret-down"></i></div>
       </div>
     </div>
+
+    ${fora ? `
+    <section class="motivo" id="motivoBox">
+      <div class="motivo-head"><i class="ph ph-prohibit"></i>
+        <strong>Por que foi ${l.etapa === "perdido" ? "perdido" : "descartado"}</strong></div>
+      <div class="motivo-chips">${estado.motivos.map((m) =>
+        `<button class="pill ${l.motivo === m ? "on" : ""}" data-motivo="${esc(m)}">${esc(m)}</button>`).join("")}</div>
+      <textarea id="motivo" rows="2" placeholder="Descreva o motivo">${esc(l.motivo || "")}</textarea>
+      <div class="salvo" id="motivoSalvo"></div>
+    </section>` : ""}
 
     <div class="actions">
       <a class="btn primary" id="wa" target="_blank" rel="noopener" ${fone ? "" : 'aria-disabled="true"'}><i class="ph ph-whatsapp-logo"></i>Abrir no WhatsApp</a>
@@ -177,6 +215,10 @@ function renderDetalhe(l) {
 
         <section class="section">
           <h2><i class="ph ph-chat-text"></i>Mensagem de abordagem</h2>
+          ${estado.perfil.nome ? "" : `
+          <div class="aviso"><i class="ph ph-info"></i>
+            <span>Preencha seu nome no perfil para a mensagem sair assinada.</span>
+            <button class="link" data-abrir-run>Abrir perfil</button></div>`}
           <div class="msg">
             <textarea id="msg" spellcheck="true">${esc(l.mensagem)}</textarea>
             <div class="msg-foot">
@@ -211,11 +253,26 @@ function renderDetalhe(l) {
     </div>
   </div>`;
 
-  ligarDetalhe(l, fone);
-  $("#detalhe").scrollTop = 0;
+  ligarLead(l, fone);
 }
 
-function ligarDetalhe(l, fone) {
+// salva o campo `campo` sozinho 700ms depois de parar de digitar
+function autoSalvar(el, status, l, campo) {
+  let timer;
+  el.addEventListener("input", () => {
+    status.innerHTML = '<i class="ph ph-dots-three"></i>Editando…';
+    clearTimeout(timer);
+    timer = setTimeout(async () => {
+      try {
+        await salvarLead(l, { [campo]: el.value });
+        status.innerHTML = '<i class="ph ph-check"></i>Salvo';
+        if (campo === "motivo") document.querySelectorAll("[data-motivo]").forEach((b) => b.classList.toggle("on", b.dataset.motivo === el.value));
+      } catch { status.innerHTML = '<i class="ph ph-warning-circle"></i>Erro ao salvar'; }
+    }, 700);
+  });
+}
+
+function ligarLead(l, fone) {
   const msg = $("#msg"), wa = $("#wa");
   const atualizar = () => {
     if (fone) wa.href = `https://wa.me/${fone}?text=${encodeURIComponent(msg.value)}`;
@@ -226,7 +283,7 @@ function ligarDetalhe(l, fone) {
 
   wa.addEventListener("click", async () => {
     if (["abordagem_pronta", "qualificado"].includes(l.etapa)) {
-      await salvar(l, { etapa: "contatado" });
+      await salvarLead(l, { etapa: "contatado" });
       $("#etapa").value = "contatado";
       renderLista();
       toast("Marcado como contatado");
@@ -239,38 +296,275 @@ function ligarDetalhe(l, fone) {
   });
 
   $("#etapa").addEventListener("change", async (e) => {
+    const etapa = e.target.value;
+    const saiu = FORA_DO_FUNIL.includes(etapa) !== FORA_DO_FUNIL.includes(l.etapa);
     try {
-      await salvar(l, { etapa: e.target.value });
+      await salvarLead(l, { etapa, motivo: FORA_DO_FUNIL.includes(etapa) ? l.motivo : "" });
       renderLista();
-      toast(`Etapa: ${ETAPA_NOME[e.target.value]}`);
+      if (saiu) {
+        renderLead(l);  // mostra/esconde o bloco de motivo
+        if (FORA_DO_FUNIL.includes(etapa)) { $("#motivoBox").scrollIntoView({ block: "nearest" }); $("#motivo").focus(); }
+      }
+      toast(FORA_DO_FUNIL.includes(etapa) ? "Informe o motivo" : `Etapa: ${ETAPA_NOME[etapa]}`, FORA_DO_FUNIL.includes(etapa) ? "info" : "check-circle");
     } catch { toast("Erro ao salvar", "warning-circle"); }
   });
 
-  // notas salvam sozinhas 700ms depois de parar de digitar
-  const notas = $("#notas"), status = $("#salvo");
-  let timer;
-  notas.addEventListener("input", () => {
-    status.innerHTML = '<i class="ph ph-dots-three"></i>Editando…';
-    clearTimeout(timer);
-    timer = setTimeout(async () => {
-      try {
-        await salvar(l, { notas: notas.value });
-        status.innerHTML = '<i class="ph ph-check"></i>Salvo';
-      } catch { status.innerHTML = '<i class="ph ph-warning-circle"></i>Erro ao salvar'; }
-    }, 700);
-  });
-
-  $("#voltar").addEventListener("click", () => $(".app").classList.remove("aberto"));
+  autoSalvar($("#notas"), $("#salvo"), l, "notas");
+  if ($("#motivo")) {
+    autoSalvar($("#motivo"), $("#motivoSalvo"), l, "motivo");
+    document.querySelectorAll("[data-motivo]").forEach((b) => b.addEventListener("click", async () => {
+      $("#motivo").value = b.dataset.motivo;
+      await salvarLead(l, { motivo: b.dataset.motivo });
+      document.querySelectorAll("[data-motivo]").forEach((x) => x.classList.toggle("on", x === b));
+      $("#motivoSalvo").innerHTML = '<i class="ph ph-check"></i>Salvo';
+    }));
+  }
 }
 
 function selecionar(id) {
   const l = estado.leads.find((x) => x.id === id);
   if (!l) return;
   estado.sel = id;
+  estado.view = "lead";
   document.querySelectorAll(".lead").forEach((el) => el.setAttribute("aria-selected", el.dataset.id === id));
   document.querySelector(`.lead[data-id="${CSS.escape(id)}"]`)?.scrollIntoView({ block: "nearest" });
   $(".app").classList.add("aberto");
-  renderDetalhe(l);
+  renderStatusSidebar();
+  renderLead(l);
+  $("#detalhe").scrollTop = 0;
+}
+
+// ---------- prospecção ----------
+function estimativa() {
+  const buscas = estado.form.cidades.length * estado.form.nichos.length;
+  const porBusca = estado.form.fonte === "google" ? 40 : 90;  // segundos, inclui checar os sites e a pausa entre buscas
+  return { buscas, tempo: buscas * porBusca };
+}
+
+function renderRun() {
+  const f = estado.form, b = estado.bot, rodando = !!b?.rodando;
+  const nichos = b?.nichos || [];
+  const { buscas, tempo } = estimativa();
+  $("#detalhe").innerHTML = `
+  <div class="wrap">
+    <button class="btn voltar" data-voltar><i class="ph ph-arrow-left"></i>Leads</button>
+    <div class="head">
+      <div>
+        <div class="eyebrow">Prospecção</div>
+        <h1>Nova prospecção</h1>
+        <p class="lead-txt">Escolha onde e em quais nichos procurar. O bot encontra os negócios, analisa o site de cada um e prepara a abordagem.</p>
+      </div>
+    </div>
+
+    <div id="progresso"></div>
+
+    <div class="cols">
+      <div>
+        <fieldset class="form" ${rodando ? "disabled" : ""}>
+          <section class="section">
+            <h2><i class="ph ph-map-trifold"></i>Cidades</h2>
+            <div class="tags" id="tags">
+              ${f.cidades.map((c, i) => `<span class="tag">${esc(c)}<button type="button" data-rm="${i}" aria-label="Remover ${esc(c)}"><i class="ph ph-x"></i></button></span>`).join("")}
+              <input id="cidadeIn" placeholder="${f.cidades.length ? "Adicionar cidade" : "Ex.: Campinas"}" autocomplete="off">
+            </div>
+            <p class="hint">Pressione Enter para adicionar. Use o nome oficial do município.</p>
+          </section>
+
+          <section class="section">
+            <h2><i class="ph ph-storefront"></i>Nichos
+              <span class="h2-acoes"><button type="button" class="link" id="todos">Todos</button><button type="button" class="link" id="nenhum">Limpar</button></span></h2>
+            <div class="nichos">${nichos.map((n) => `
+              <button type="button" class="nicho ${f.nichos.includes(n.id) ? "on" : ""}" data-nicho="${n.id}" aria-pressed="${f.nichos.includes(n.id)}">
+                <i class="ph ${f.nichos.includes(n.id) ? "ph-check-square" : "ph-square"}"></i>${esc(n.rotulo)}</button>`).join("")}
+            </div>
+          </section>
+
+          <section class="section">
+            <h2><i class="ph ph-database"></i>Fonte de dados</h2>
+            <div class="fontes">
+              <label class="fonte ${f.fonte === "osm" ? "on" : ""}"><input type="radio" name="fonte" value="osm" ${f.fonte === "osm" ? "checked" : ""}>
+                <strong>OpenStreetMap</strong><span>Gratuito, sem configuração. Cobertura menor no Brasil.</span></label>
+              <label class="fonte ${f.fonte === "google" ? "on" : ""}"><input type="radio" name="fonte" value="google" ${f.fonte === "google" ? "checked" : ""}>
+                <strong>Google Places</strong><span>Muito mais negócios e avaliações. Requer chave de API.</span></label>
+            </div>
+            ${f.fonte === "google" ? `
+            <div class="chave">
+              <label class="campo"><span><i class="ph ph-key"></i>Chave do Google Places</span>
+                <input type="password" id="chave" placeholder="${estado.temKey ? "Chave salva · cole outra para trocar" : "Cole sua chave aqui"}" autocomplete="off"></label>
+              <button type="button" class="btn" id="salvarChave">Salvar chave</button>
+            </div>` : ""}
+          </section>
+
+          <section class="section">
+            <label class="switch">
+              <input type="checkbox" id="loop" ${f.loop ? "checked" : ""}><span class="trilho"></span>
+              <span><strong>Repetir a cada 6 horas</strong><small>Ideal para deixar rodando durante a noite. Só leads novos são adicionados.</small></span>
+            </label>
+          </section>
+
+          <div class="iniciar">
+            <div class="resumo">${buscas ? `<strong>${buscas} ${buscas === 1 ? "busca" : "buscas"}</strong><span>Tempo estimado: ${duracao(tempo)}</span>`
+              : `<span>Adicione ao menos uma cidade e um nicho</span>`}</div>
+            <button type="button" class="btn accent grande" id="iniciar" ${buscas ? "" : "disabled"}><i class="ph ph-play"></i>Iniciar prospecção</button>
+          </div>
+        </fieldset>
+      </div>
+
+      <div>
+        <section class="section">
+          <h2><i class="ph ph-user-circle"></i>Seu perfil</h2>
+          <div class="card perfil">
+            <p class="hint">Usado na apresentação e na assinatura das mensagens.</p>
+            <label class="campo"><span>Nome</span><input id="pNome" value="${esc(estado.perfil.nome || "")}" placeholder="Seu nome"></label>
+            <label class="campo"><span>Como você se apresenta</span><input id="pFuncao" value="${esc(estado.perfil.funcao || "")}" placeholder="desenvolvedor web"></label>
+            <label class="campo"><span>Portfólio ou site</span><input id="pPortfolio" value="${esc(estado.perfil.portfolio || "")}" placeholder="seusite.com.br"></label>
+            <div class="salvo" id="perfilSalvo"></div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </div>`;
+  renderProgresso();
+  ligarRun();
+}
+
+function renderProgresso() {
+  const el = $("#progresso"), b = estado.bot;
+  if (!el) return;
+  if (!b || b.status === "ocioso") { el.innerHTML = ""; return; }
+  const pct = b.total ? Math.round(((b.rodando && !b.aguardando ? b.atual - 1 : b.atual) / b.total) * 100) : 0;
+  const decorrido = b.inicio ? duracao(Date.now() / 1000 - b.inicio) : "";
+  const titulo = b.aguardando ? "Rodada concluída · aguardando a próxima (6 h)"
+    : b.rodando ? `Buscando ${b.atual} de ${b.total}`
+    : b.status === "concluido" ? "Prospecção concluída" : "Prospecção interrompida";
+  const icone = b.rodando && !b.aguardando ? "ph-circle-notch girando" : b.aguardando ? "ph-clock" : b.status === "concluido" ? "ph-check-circle" : "ph-pause";
+  const aberto = el.querySelector("details")?.open;
+  el.innerHTML = `
+  <div class="progresso ${b.rodando ? "rodando" : b.status}">
+    <div class="prog-head">
+      <i class="ph ${icone}"></i>
+      <div class="prog-txt"><strong>${titulo}</strong><span>${b.rodando && !b.aguardando ? esc(b.etapa) : esc((b.params?.cidades || []).join(", "))}</span></div>
+      ${b.rodando ? `<button class="btn" id="parar"><i class="ph ph-stop"></i>Parar</button>`
+        : `<button class="btn" id="verLeads"><i class="ph ph-list-bullets"></i>Ver leads</button>`}
+    </div>
+    <div class="barra"><span style="width:${b.rodando ? pct : 100}%"></span></div>
+    <div class="prog-stats">
+      <span><strong>${b.novos}</strong> leads novos</span>
+      <span><strong>${decorrido}</strong> decorrido</span>
+      ${b.avisos ? `<span class="aviso-txt"><i class="ph ph-warning"></i>${b.avisos} ${b.avisos === 1 ? "nova tentativa" : "novas tentativas"} de conexão</span>` : ""}
+    </div>
+    <details ${aberto ? "open" : ""}><summary><i class="ph ph-terminal-window"></i>Log de execução</summary>
+      <pre>${esc(b.log.join("\n")) || "Iniciando…"}</pre></details>
+  </div>`;
+  const pre = el.querySelector("pre");
+  if (pre) pre.scrollTop = pre.scrollHeight;
+  $("#parar")?.addEventListener("click", async () => {
+    estado.bot = await api("/api/bot/parar", {});
+    toast("Prospecção interrompida", "pause");
+    atualizarBotUI(true);
+  });
+  $("#verLeads")?.addEventListener("click", () => { estado.temp = "quente"; renderLista(); $(".app").classList.remove("aberto"); });
+}
+
+function guardarForm() { guardar.set("form", JSON.stringify(estado.form)); }
+
+function ligarRun() {
+  const f = estado.form;
+  const adicionar = (txt) => {
+    txt.split(",").map((c) => c.trim()).filter(Boolean).forEach((c) => {
+      if (!f.cidades.some((x) => x.toLowerCase() === c.toLowerCase())) f.cidades.push(c);
+    });
+    guardarForm();
+    renderRun();
+    $("#cidadeIn").focus();
+  };
+  const input = $("#cidadeIn");
+  input.addEventListener("keydown", (e) => {
+    if ((e.key === "Enter" || e.key === ",") && input.value.trim()) { e.preventDefault(); adicionar(input.value); }
+    if (e.key === "Backspace" && !input.value && f.cidades.length) { f.cidades.pop(); guardarForm(); renderRun(); $("#cidadeIn").focus(); }
+  });
+  // adia o redesenho para não engolir um clique em "Iniciar" logo após digitar
+  input.addEventListener("blur", () => setTimeout(() => { if (input.isConnected && input.value.trim()) adicionar(input.value); }, 200));
+  $("#tags").addEventListener("click", (e) => {
+    const rm = e.target.closest("[data-rm]");
+    if (rm) { f.cidades.splice(+rm.dataset.rm, 1); guardarForm(); renderRun(); }
+    else if (e.target === $("#tags")) input.focus();
+  });
+
+  document.querySelectorAll("[data-nicho]").forEach((b) => b.addEventListener("click", () => {
+    const id = b.dataset.nicho;
+    f.nichos = f.nichos.includes(id) ? f.nichos.filter((x) => x !== id) : [...f.nichos, id];
+    guardarForm(); renderRun();
+  }));
+  $("#todos").addEventListener("click", () => { f.nichos = estado.bot.nichos.map((n) => n.id); guardarForm(); renderRun(); });
+  $("#nenhum").addEventListener("click", () => { f.nichos = []; guardarForm(); renderRun(); });
+
+  document.querySelectorAll('[name="fonte"]').forEach((r) => r.addEventListener("change", () => { f.fonte = r.value; guardarForm(); renderRun(); }));
+  $("#loop").addEventListener("change", (e) => { f.loop = e.target.checked; guardarForm(); });
+
+  $("#salvarChave")?.addEventListener("click", async () => {
+    const v = $("#chave").value.trim();
+    if (!v) return toast("Cole a chave antes de salvar", "warning-circle");
+    await api("/api/config", { google_key: v });
+    estado.temKey = true;
+    toast("Chave salva neste computador");
+    renderRun();
+  });
+
+  $("#iniciar").addEventListener("click", async () => {
+    const pendente = $("#cidadeIn").value.trim();
+    if (pendente) { $("#cidadeIn").value = ""; pendente.split(",").map((c) => c.trim()).filter(Boolean).forEach((c) => f.cidades.push(c)); guardarForm(); }
+    try {
+      estado.bot = await api("/api/bot/iniciar", f);
+      toast("Prospecção iniciada", "rocket-launch");
+      atualizarBotUI(true);
+    } catch (e) { toast(e.message, "warning-circle"); }
+  });
+
+  // perfil salva sozinho
+  let timer;
+  ["#pNome", "#pFuncao", "#pPortfolio"].forEach((s) => $(s).addEventListener("input", () => {
+    $("#perfilSalvo").innerHTML = '<i class="ph ph-dots-three"></i>Editando…';
+    clearTimeout(timer);
+    timer = setTimeout(async () => {
+      estado.perfil = { nome: $("#pNome").value.trim(), funcao: $("#pFuncao").value.trim(), portfolio: $("#pPortfolio").value.trim() };
+      try {
+        await api("/api/config", { perfil: estado.perfil });
+        $("#perfilSalvo").innerHTML = '<i class="ph ph-check"></i>Salvo · as mensagens já usam seu perfil';
+        carregarLeads();
+      } catch { $("#perfilSalvo").innerHTML = '<i class="ph ph-warning-circle"></i>Erro ao salvar'; }
+    }, 700);
+  }));
+}
+
+function abrirRun() {
+  estado.view = "run";
+  $(".app").classList.add("aberto");
+  document.querySelectorAll(".lead").forEach((el) => el.setAttribute("aria-selected", "false"));
+  renderStatusSidebar();
+  renderRun();
+  $("#detalhe").scrollTop = 0;
+}
+
+// atualiza sidebar e a tela de prospecção; `forcar` redesenha o formulário (ex.: travar/destravar)
+let estavaRodando = false;
+function atualizarBotUI(forcar = false) {
+  const rodando = !!estado.bot?.rodando;
+  renderStatusSidebar();
+  if (estado.view === "run") {
+    if (forcar || rodando !== estavaRodando) renderRun();
+    else renderProgresso();
+  }
+  if (estavaRodando && !rodando) carregarLeads();
+  estavaRodando = rodando;
+}
+
+async function pollBot() {
+  try {
+    estado.bot = await api("/api/bot");
+    atualizarBotUI();
+  } catch {}
+  setTimeout(pollBot, estado.bot?.rodando ? 2000 : 10000);
 }
 
 // ---------- tema ----------
@@ -280,7 +574,7 @@ function aplicarTema(t) {
   $("#tema").innerHTML = `<i class="ph ph-${escuro ? "sun" : "moon"}"></i>`;
 }
 
-// ---------- eventos ----------
+// ---------- eventos globais ----------
 $("#tabs").addEventListener("click", (e) => {
   const b = e.target.closest(".tab");
   if (!b) return;
@@ -298,6 +592,11 @@ $("#busca").addEventListener("input", renderLista);
     e.target.parentElement.classList.toggle("ativo", !!e.target.value);
     renderLista();
   }));
+$("#abrirRun").addEventListener("click", abrirRun);
+$("#detalhe").addEventListener("click", (e) => {
+  if (e.target.closest("[data-voltar]")) $(".app").classList.remove("aberto");
+  if (e.target.closest("[data-abrir-run]")) abrirRun();
+});
 $("#tema").addEventListener("click", () => {
   const escuro = document.documentElement.dataset.theme
     ? document.documentElement.dataset.theme === "dark"
@@ -313,14 +612,30 @@ document.addEventListener("keydown", (e) => {
   e.preventDefault();
   const ids = filtrados().map((l) => l.id);
   if (!ids.length) return;
-  const i = ids.indexOf(estado.sel);
+  const i = estado.view === "lead" ? ids.indexOf(estado.sel) : -1;
   const prox = e.key === "ArrowDown" ? Math.min(i + 1, ids.length - 1) : Math.max(i - 1, 0);
   selecionar(ids[i === -1 ? 0 : prox]);
 });
 
 // ---------- início ----------
-estado.temp = guardar.get("temp") ?? "quente";
-aplicarTema(guardar.get("tema"));
-carregar().catch(() => ($("#total").textContent = "Erro ao carregar os leads"));
-// o bot continua rodando: atualiza a lista a cada minuto sem mexer no lead aberto
-setInterval(() => carregar().catch(() => {}), 60000);
+(async function iniciar() {
+  estado.temp = guardar.get("temp") ?? "quente";
+  try { Object.assign(estado.form, JSON.parse(guardar.get("form") || "{}")); } catch {}
+  aplicarTema(guardar.get("tema"));
+  try {
+    const [cfg, b] = await Promise.all([api("/api/config"), api("/api/bot")]);
+    estado.perfil = cfg.perfil || {};
+    estado.temKey = cfg.tem_google_key;
+    estado.bot = b;
+    estavaRodando = b.rodando;
+    if (!estado.form.nichos.length) estado.form.nichos = b.nichos.map((n) => n.id);
+    await carregarLeads();
+    renderStatusSidebar();
+    if (!estado.leads.length || b.rodando) abrirRun();
+  } catch {
+    $("#total").textContent = "Erro ao carregar. O painel.py está rodando?";
+  }
+  setTimeout(pollBot, 2000);
+  // lista atualiza sozinha enquanto o bot encontra leads novos
+  setInterval(() => { if (estado.bot?.rodando) carregarLeads().catch(() => {}); }, 15000);
+})();

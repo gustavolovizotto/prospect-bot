@@ -3,3 +3,4 @@ leads.csv
 run.log
 __pycache__/
 .claude/
+config.json
