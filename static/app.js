@@ -652,10 +652,10 @@ function renderContato() {
       </ul>
       <div class="comando">
         <div><strong>Pronto para enviar</strong>
-          <span>Abre cada conversa no WhatsApp Web com a mensagem pronta. Você confere e aperta Enter.</span></div>
-        <button class="btn accent grande" id="iniciarSeq"><i class="ph ph-play-circle"></i>Enviar em sequência</button>
+          <span>Abre cada conversa no WhatsApp Web com a mensagem pronta. Você aperta Enter lá; o painel não consegue enviar sozinho.</span></div>
+        <button class="btn accent grande" id="iniciarSeq"><i class="ph ph-play-circle"></i>Abrir conversas em sequência</button>
       </div>
-      <p class="hint">Ou peça ao Claude no chat: <code id="cmdTxt">Envie a fila de contato automático</code>
+      <p class="hint">Envio automático (sem apertar Enter): peça ao Claude no chat <code id="cmdTxt">Envie a fila de contato automático</code>
         <button class="link" id="copiarCmd">copiar</button></p>` : `<p class="ok-site">A fila está vazia. Selecione leads abaixo.</p>`}
     </section>
 
@@ -754,7 +754,7 @@ async function iniciarSequencia() {
   const ids = estado.fila.itens.filter((i) => i.envio === "fila").map((i) => i.id);
   if (!ids.length) return;
   try { estado.fila = await api("/api/fila", { ids, acao: "adicionar" }); } catch {}  // recalcula a saudação para agora
-  estado.seq = { ids, i: 0, aberto: false, espera: 0, enviados: 0, pulados: 0 };
+  estado.seq = { ids, i: 0, aberto: false, confirmado: false, espera: 0, enviados: 0, pulados: 0 };
   renderSeq();
 }
 
@@ -773,7 +773,7 @@ function renderSeq() {
   el.innerHTML = `
   <div class="seq" role="dialog" aria-modal="true" aria-labelledby="seqTitulo">
     <div class="seq-head">
-      <div><div class="eyebrow">Enviar em sequência</div>
+      <div><div class="eyebrow">Abrir conversas em sequência</div>
         <strong id="seqTitulo">${fim ? "Fila concluída" : `${q.i + 1} de ${q.ids.length}`}</strong></div>
       <button class="icon-btn" id="seqFechar" aria-label="Encerrar envio"><i class="ph ph-x"></i></button>
     </div>
@@ -792,13 +792,16 @@ function renderSeq() {
     <ol class="seq-passos">
       <li class="${q.aberto ? "feito" : "atual"}">Abra a conversa no WhatsApp Web</li>
       <li class="${q.aberto ? "atual" : ""}">Confira a mensagem e aperte <kbd>Enter</kbd> lá</li>
-      <li>Volte aqui e confirme o envio</li>
+      <li class="${q.confirmado ? "feito" : ""}">Volte aqui e confirme que a mensagem saiu</li>
     </ol>
+    ${q.aberto ? `
+    <label class="seq-confirma"><input type="checkbox" id="seqConfirma" ${q.confirmado ? "checked" : ""}>
+      <span>Apertei Enter e a mensagem apareceu na conversa</span></label>` : ""}
     <div class="seq-acoes">
       <button class="btn" id="seqPular" title="O WhatsApp avisou que o número não tem conta"><i class="ph ph-skip-forward"></i>Pular: sem WhatsApp</button>
       ${q.aberto
         ? `<button class="btn" id="seqAbrir"><i class="ph ph-arrow-square-out"></i>Abrir de novo</button>
-           <button class="btn accent" id="seqEnviei"><i class="ph ph-check"></i>Enviei, próximo</button>`
+           <button class="btn accent" id="seqEnviei" ${q.confirmado ? "" : "disabled"} title="Marque a confirmação acima para liberar"><i class="ph ph-check"></i>Enviei, próximo</button>`
         : q.espera > 0
           ? `<button class="btn accent" disabled><i class="ph ph-timer"></i>Próximo em ${q.espera}s</button>`
           : `<button class="btn primary" id="seqAbrir"><i class="ph ph-whatsapp-logo"></i>Abrir no WhatsApp</button>`}
@@ -822,7 +825,7 @@ async function registrar(status) {
     await api("/api/fila/resultado", { id: it.id, status, erro: status === "falhou" ? "Número sem WhatsApp" : "" });
   } catch (e) { toast(e.message, "warning-circle"); return; }
   status === "enviado" ? q.enviados++ : q.pulados++;
-  q.i++; q.aberto = false;
+  q.i++; q.aberto = false; q.confirmado = false;
   q.espera = status === "enviado" && q.i < q.ids.length ? INTERVALO_ENVIO : 0;
   renderSeq();
   clearInterval(q.timer);
@@ -845,7 +848,8 @@ function ligarSeq() {
   $("#seqFechar")?.addEventListener("click", fecharSeq);
   $("#seqOk")?.addEventListener("click", fecharSeq);
   $("#seqAbrir")?.addEventListener("click", abrirConversa);
-  $("#seqEnviei")?.addEventListener("click", () => registrar("enviado"));
+  $("#seqConfirma")?.addEventListener("change", (e) => { estado.seq.confirmado = e.target.checked; renderSeq(); });
+  $("#seqEnviei")?.addEventListener("click", () => estado.seq.confirmado && registrar("enviado"));
   $("#seqPular")?.addEventListener("click", () => {
     if (confirm("Marcar este lead como sem WhatsApp e pular?")) registrar("falhou");
   });

@@ -434,8 +434,9 @@ def mensagem(lead, perfil=None, hora=None):
         obs = ("Vi que hoje o principal canal online de vocês é a rede social. Ela é ótima para relacionamento, "
                "mas não aparece bem nas buscas do Google e depende do alcance que o algoritmo libera.")
     elif "fora do ar" in diag:
-        obs = (f"Tentei acessar o site de vocês ({site}) e ele não está carregando. Enquanto isso, "
-               "quem procura por vocês no Google encontra uma página de erro.")
+        # o endereço vem do cadastro público e pode estar errado: falar do cadastro, não afirmar que o site deles caiu
+        obs = (f"O endereço de site que aparece no cadastro de vocês ({site}) não está abrindo. "
+               "Quem tenta acessar por ali encontra uma página de erro, e o cliente acaba indo para o concorrente.")
     else:
         frases = [f for k, f in PROBLEMA_FRASE.items() if k in diag]
         obs = (f"Acessei o site de vocês ({site}) e notei que ele {juntar(frases)}, pontos que costumam afastar visitantes."

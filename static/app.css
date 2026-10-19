@@ -516,3 +516,9 @@ kbd { padding: 1px 6px; border: 1px solid var(--line-strong); border-bottom-widt
   .seq-acoes .btn { justify-content: center; }
   .seq-acoes #seqPular { margin-right: 0; }
 }
+.seq-confirma {
+  display: flex; align-items: center; gap: 10px; margin: -6px 0 18px; padding: 10px 12px; cursor: pointer;
+  border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--sunken); font-size: 13px; font-weight: 500;
+}
+.seq-confirma:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+.seq-confirma input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
