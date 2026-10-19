@@ -24,7 +24,10 @@ const estado = {
   temp: "quente", sel: null, view: "vazio",       // view: vazio | lead | run
   bot: null, perfil: {}, temKey: false,
   form: { cidades: [], nichos: [], fonte: "osm", loop: false },
+  fila: { itens: [], enviados_hoje: 0 },
+  marcados: new Set(), cf: { temp: "quente", nicho: "", cidade: "" },  // seleção da aba Contato automático
 };
+const LIMITE_DIA = 20;  // acima disso o WhatsApp tende a bloquear números que mandam para desconhecidos
 const $ = (s) => document.querySelector(s);
 
 // ---------- utilidades ----------
@@ -145,6 +148,12 @@ function renderStatusSidebar() {
     : b.status === "concluido" ? `Concluída · ${b.novos} leads novos`
     : b.status === "parado" ? "Interrompida" : "Defina cidades e nichos";
   btn.querySelector(".run-ico i").className = b?.rodando && !b.aguardando ? "ph ph-circle-notch girando" : "ph ph-rocket-launch";
+
+  const naFila = estado.fila.itens.filter((i) => i.envio === "fila").length;
+  $("#abrirContato").classList.toggle("ativo", estado.view === "contato");
+  $("#contatoStatus").textContent = naFila
+    ? `${naFila} na fila · ${estado.fila.enviados_hoje} enviados hoje`
+    : estado.fila.enviados_hoje ? `${estado.fila.enviados_hoje} enviados hoje` : "Monte a fila de envio";
 }
 
 // ---------- detalhe do lead ----------
@@ -563,8 +572,170 @@ async function pollBot() {
   try {
     estado.bot = await api("/api/bot");
     atualizarBotUI();
+    const antes = JSON.stringify(estado.fila);
+    await carregarFila();
+    if (estado.view === "contato" && JSON.stringify(estado.fila) !== antes && !document.activeElement.matches("select")) {
+      await carregarLeads();
+      const y = $("#detalhe").scrollTop;
+      renderContato();
+      $("#detalhe").scrollTop = y;
+    }
   } catch {}
-  setTimeout(pollBot, estado.bot?.rodando ? 2000 : 10000);
+  setTimeout(pollBot, estado.bot?.rodando || estado.view === "contato" ? 3000 : 10000);
+}
+
+// ---------- contato automático ----------
+const elegivel = (l) => !!foneWhats(l) && ["abordagem_pronta", "qualificado"].includes(l.etapa) && !l.envio;
+
+function candidatos() {
+  const { temp, nicho: n, cidade: c } = estado.cf;
+  return estado.leads.filter((l) => elegivel(l) && (!temp || temperatura(l) === temp) && (!n || l.nicho === n) && (!c || l.cidade === c));
+}
+
+async function carregarFila() {
+  estado.fila = await api("/api/fila");
+  renderStatusSidebar();
+}
+
+function renderContato() {
+  const fila = estado.fila.itens.filter((i) => i.envio === "fila");
+  const historico = estado.fila.itens.filter((i) => i.envio !== "fila").slice(0, 30);
+  const lista = candidatos();
+  const base = estado.leads.filter(elegivel);
+  const conta = { quente: 0, morno: 0, frio: 0, "": base.length };
+  base.forEach((l) => conta[temperatura(l)]++);
+  const marcados = [...estado.marcados].filter((id) => base.some((l) => l.id === id));
+  const total = estado.fila.enviados_hoje + fila.length;
+  const opcoes = (valores, atual, rotulo, nomear = (v) => v) => `<option value="">${rotulo}</option>` +
+    [...new Set(valores)].sort().map((v) => `<option value="${esc(v)}" ${v === atual ? "selected" : ""}>${esc(nomear(v))}</option>`).join("");
+
+  $("#detalhe").innerHTML = `
+  <div class="wrap">
+    <button class="btn voltar" data-voltar><i class="ph ph-arrow-left"></i>Leads</button>
+    <div class="head">
+      <div>
+        <div class="eyebrow">Contato automático</div>
+        <h1>Fila de envio</h1>
+        <p class="lead-txt">Selecione os leads e adicione à fila. Depois peça ao Claude no chat para enviar: ele mostra a lista,
+          espera sua confirmação e envia um por um pelo WhatsApp Web, marcando cada lead como contatado.</p>
+      </div>
+    </div>
+
+    ${!estado.perfil.nome ? `
+    <div class="aviso"><i class="ph ph-info"></i><span>Preencha seu nome no perfil antes de montar a fila: ele vai na mensagem.</span>
+      <button class="link" data-abrir-run>Abrir perfil</button></div>` : ""}
+    ${total > LIMITE_DIA ? `
+    <div class="aviso"><i class="ph ph-warning"></i><span>${total} mensagens para hoje. Para não ter o número bloqueado,
+      mantenha até ${LIMITE_DIA} por dia para contatos que não te conhecem.</span></div>` : ""}
+
+    <section class="section">
+      <h2><i class="ph ph-queue"></i>Na fila <span class="count-h">${fila.length}</span>
+        ${fila.length ? `<span class="h2-acoes"><button class="link" id="limparFila">Esvaziar fila</button></span>` : ""}</h2>
+      ${fila.length ? `
+      <ul class="fila">${fila.map((i) => `
+        <li class="fila-item">
+          <div class="fila-info"><strong>${esc(i.nome)}</strong><span>${esc(nicho(i.nicho))} · ${esc(i.cidade)} · ${esc(i.telefone)}</span></div>
+          <details><summary>Mensagem</summary><pre class="fila-msg">${esc(i.envio_msg)}</pre></details>
+          <button class="icon-btn" data-tirar="${esc(i.id)}" title="Tirar da fila" aria-label="Tirar ${esc(i.nome)} da fila"><i class="ph ph-x"></i></button>
+        </li>`).join("")}
+      </ul>
+      <div class="comando">
+        <div><strong>Pronto para enviar</strong><span>Cole no chat do Claude:</span></div>
+        <code id="cmdTxt">Envie a fila de contato automático</code>
+        <button class="btn" id="copiarCmd"><i class="ph ph-copy"></i>Copiar</button>
+      </div>` : `<p class="ok-site">A fila está vazia. Selecione leads abaixo.</p>`}
+    </section>
+
+    <section class="section">
+      <h2><i class="ph ph-list-checks"></i>Selecionar leads</h2>
+      <div class="sel-filtros">
+        <div class="tabs mini">${TEMPS.map(([k, nome]) => `
+          <button class="tab" data-ctemp="${k}" aria-selected="${estado.cf.temp === k}">${k ? `<span class="dot ${k}"></span>` : ""}${nome}<span class="count">${conta[k]}</span></button>`).join("")}
+        </div>
+        <label class="select"><select id="cNicho">${opcoes(base.map((l) => l.nicho), estado.cf.nicho, "Nicho", nicho)}</select><i class="ph ph-caret-down"></i></label>
+        <label class="select"><select id="cCidade">${opcoes(base.map((l) => l.cidade), estado.cf.cidade, "Cidade")}</select><i class="ph ph-caret-down"></i></label>
+      </div>
+      ${lista.length ? `
+      <div class="sel-lista">
+        <label class="sel-todos"><input type="checkbox" id="marcarTodos" ${lista.every((l) => estado.marcados.has(l.id)) ? "checked" : ""}>
+          <span>Selecionar os ${lista.length} visíveis</span></label>
+        ${lista.map((l) => `
+        <label class="sel-item">
+          <input type="checkbox" data-marcar="${esc(l.id)}" ${estado.marcados.has(l.id) ? "checked" : ""}>
+          <span class="sel-nome"><strong>${esc(l.nome)}</strong><span>${esc(nicho(l.nicho))} · ${esc(l.cidade)} · ${esc(l.diagnostico)}</span></span>
+          <span class="score"><span class="dot ${temperatura(l)}"></span>${l.score}</span>
+        </label>`).join("")}
+      </div>` : `<p class="ok-site">Nenhum lead com WhatsApp disponível nesse filtro.</p>`}
+    </section>
+
+    ${historico.length ? `
+    <section class="section">
+      <h2><i class="ph ph-clock"></i>Histórico de envios</h2>
+      <ul class="fila">${historico.map((i) => `
+        <li class="fila-item">
+          <i class="ph-fill ${i.envio === "enviado" ? "ph-check-circle ok" : "ph-x-circle erro"}"></i>
+          <div class="fila-info"><strong>${esc(i.nome)}</strong>
+            <span>${i.envio === "enviado" ? "Enviado" : `Falhou: ${esc(i.envio_erro || "erro desconhecido")}`} · ${esc((i.envio_em || "").replace("T", " ").slice(0, 16))}</span></div>
+        </li>`).join("")}
+      </ul>
+    </section>` : ""}
+  </div>
+
+  <div class="barra-acao ${marcados.length ? "on" : ""}">
+    <span><strong>${marcados.length}</strong> ${marcados.length === 1 ? "lead selecionado" : "leads selecionados"}</span>
+    <button class="btn" id="desmarcar">Limpar</button>
+    <button class="btn accent" id="enfileirar"><i class="ph ph-plus"></i>Adicionar à fila</button>
+  </div>`;
+  ligarContato(lista, marcados);
+}
+
+function ligarContato(lista, marcados) {
+  const rerender = () => renderContato();
+  document.querySelectorAll("[data-ctemp]").forEach((b) => b.addEventListener("click", () => { estado.cf.temp = b.dataset.ctemp; rerender(); }));
+  $("#cNicho").addEventListener("change", (e) => { estado.cf.nicho = e.target.value; rerender(); });
+  $("#cCidade").addEventListener("change", (e) => { estado.cf.cidade = e.target.value; rerender(); });
+  $("#marcarTodos")?.addEventListener("change", (e) => {
+    lista.forEach((l) => (e.target.checked ? estado.marcados.add(l.id) : estado.marcados.delete(l.id)));
+    rerender();
+  });
+  document.querySelectorAll("[data-marcar]").forEach((c) => c.addEventListener("change", () => {
+    c.checked ? estado.marcados.add(c.dataset.marcar) : estado.marcados.delete(c.dataset.marcar);
+    rerender();
+  }));
+  $("#desmarcar").addEventListener("click", () => { estado.marcados.clear(); rerender(); });
+  $("#enfileirar").addEventListener("click", async () => {
+    try {
+      estado.fila = await api("/api/fila", { ids: marcados, acao: "adicionar" });
+      estado.marcados.clear();
+      await carregarLeads();
+      toast(`${marcados.length} ${marcados.length === 1 ? "lead adicionado" : "leads adicionados"} à fila`);
+      renderStatusSidebar();
+      rerender();
+    } catch (e) { toast(e.message, "warning-circle"); }
+  });
+  const tirar = async (ids) => {
+    estado.fila = await api("/api/fila", { ids, acao: "remover" });
+    await carregarLeads();
+    renderStatusSidebar();
+    rerender();
+  };
+  document.querySelectorAll("[data-tirar]").forEach((b) => b.addEventListener("click", () => tirar([b.dataset.tirar])));
+  $("#limparFila")?.addEventListener("click", () =>
+    tirar(estado.fila.itens.filter((i) => i.envio === "fila").map((i) => i.id)).then(() => toast("Fila esvaziada")));
+  $("#copiarCmd")?.addEventListener("click", async () => {
+    await navigator.clipboard.writeText($("#cmdTxt").textContent);
+    toast("Comando copiado");
+  });
+}
+
+async function abrirContato() {
+  estado.view = "contato";
+  $(".app").classList.add("aberto");
+  document.querySelectorAll(".lead").forEach((el) => el.setAttribute("aria-selected", "false"));
+  try { await carregarFila(); } catch {}
+  renderStatusSidebar();
+  renderContato();
+  $("#detalhe").scrollTop = 0;
 }
 
 // ---------- tema ----------
@@ -593,6 +764,7 @@ $("#busca").addEventListener("input", renderLista);
     renderLista();
   }));
 $("#abrirRun").addEventListener("click", abrirRun);
+$("#abrirContato").addEventListener("click", abrirContato);
 $("#detalhe").addEventListener("click", (e) => {
   if (e.target.closest("[data-voltar]")) $(".app").classList.remove("aberto");
   if (e.target.closest("[data-abrir-run]")) abrirRun();
@@ -623,7 +795,8 @@ document.addEventListener("keydown", (e) => {
   try { Object.assign(estado.form, JSON.parse(guardar.get("form") || "{}")); } catch {}
   aplicarTema(guardar.get("tema"));
   try {
-    const [cfg, b] = await Promise.all([api("/api/config"), api("/api/bot")]);
+    const [cfg, b, fila] = await Promise.all([api("/api/config"), api("/api/bot"), api("/api/fila")]);
+    estado.fila = fila;
     estado.perfil = cfg.perfil || {};
     estado.temKey = cfg.tem_google_key;
     estado.bot = b;

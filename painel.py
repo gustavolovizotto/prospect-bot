@@ -10,8 +10,12 @@ API:
   POST /api/bot/parar
   GET  /api/config         -> {"perfil", "tem_google_key"}
   POST /api/config         <- {"perfil": {...}, "google_key"?: str}
+  GET  /api/fila           -> leads na fila de envio, com telefone e mensagem congelada
+  POST /api/fila           <- {"ids": [...], "acao": "adicionar"|"remover"}
+  POST /api/fila/resultado <- {"id", "status": "enviado"|"falhou", "erro"?}  (chamado por quem envia)
 """
 import atexit, json, mimetypes, os, re, sqlite3, subprocess, sys, time
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import bot
@@ -74,6 +78,65 @@ def leads():
         if r["etapa"] == "descartado" and not r["motivo"]:  # leads antigos, de antes da coluna motivo
             r["motivo"] = bot.motivo_auto(diag, r["score"])
     return rows
+
+
+# ---------- fila de contato automático ----------
+def fone_whats(tel):
+    """Mesmo critério do bot.link_whatsapp: só números com DDD viram destino."""
+    d = re.sub(r"\D", "", tel or "")
+    if d and not d.startswith("55"):
+        d = "55" + d.lstrip("0")
+    return d if len(d) >= 12 else ""
+
+
+def fila():
+    with bot.db() as c:
+        c.row_factory = sqlite3.Row
+        rows = [dict(r) for r in c.execute(
+            "SELECT id, nome, nicho, cidade, telefone, score, envio, envio_msg, envio_em, envio_erro FROM leads "
+            "WHERE envio IS NOT NULL ORDER BY envio='fila' DESC, envio_em DESC, score DESC")]
+        hoje = c.execute("SELECT COUNT(*) FROM leads WHERE envio='enviado' AND envio_em >= ?",
+                         (datetime.now().strftime("%Y-%m-%d"),)).fetchone()[0]
+    for r in rows:
+        r["whatsapp"] = fone_whats(r["telefone"])
+    return {"itens": rows, "enviados_hoje": hoje}
+
+
+def mexer_fila(d):
+    ids = d.get("ids")
+    if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids) or not ids:
+        raise ValueError("Selecione ao menos um lead.")
+    if d.get("acao") == "remover":
+        with bot.db() as c:
+            c.executemany("UPDATE leads SET envio=NULL, envio_msg=NULL WHERE id=? AND envio='fila'", [(i,) for i in ids])
+        return
+    if d.get("acao") != "adicionar":
+        raise ValueError("Ação inválida.")
+    perfil = bot.carregar_config().get("perfil", {})
+    if not (perfil.get("nome") or "").strip():
+        raise ValueError("Preencha seu nome em Nova prospecção → Seu perfil antes de montar a fila.")
+    with bot.db() as c:
+        c.row_factory = sqlite3.Row
+        for i in ids:
+            r = c.execute("SELECT * FROM leads WHERE id=?", (i,)).fetchone()
+            if not r or not fone_whats(r["telefone"]) or r["envio"] == "enviado":
+                continue
+            # congela a mensagem como está agora (perfil e saudação do momento)
+            c.execute("UPDATE leads SET envio='fila', envio_msg=?, envio_erro=NULL WHERE id=?", (bot.mensagem(dict(r), perfil), i))
+
+
+def resultado_envio(d):
+    status = d.get("status")
+    if status not in ("enviado", "falhou") or not isinstance(d.get("id"), str):
+        raise ValueError("dados inválidos")
+    agora = datetime.now().isoformat(timespec="seconds")
+    with bot.db() as c:
+        n = c.execute("UPDATE leads SET envio=?, envio_em=?, envio_erro=? WHERE id=? AND envio='fila'",
+                      (status, agora, str(d.get("erro") or "")[:300] or None, d["id"])).rowcount
+        if n and status == "enviado":
+            c.execute("UPDATE leads SET etapa='contatado' WHERE id=? AND etapa IN ('abordagem_pronta','qualificado')", (d["id"],))
+    if not n:
+        raise ValueError("Lead não está na fila.")
 
 
 # ---------- processo do bot ----------
@@ -176,6 +239,8 @@ class H(BaseHTTPRequestHandler):
             return self.responder({"leads": leads(), "etapas": ETAPAS, "motivos": MOTIVOS})
         if self.path == "/api/bot":
             return self.responder(estado_bot())
+        if self.path == "/api/fila":
+            return self.responder(fila())
         if self.path == "/api/config":
             cfg = bot.carregar_config()
             return self.responder({"perfil": cfg.get("perfil", {}), "tem_google_key": bool(cfg.get("google_key"))})
@@ -210,6 +275,12 @@ class H(BaseHTTPRequestHandler):
             if self.path == "/api/config":
                 salvar_config(d)
                 return self.responder({"ok": True})
+            if self.path == "/api/fila":
+                mexer_fila(d)
+                return self.responder(fila())
+            if self.path == "/api/fila/resultado":
+                resultado_envio(d)
+                return self.responder({"ok": True})
         except ValueError as e:
             return self.erro(str(e))
         self.erro("não encontrado", 404)
@@ -230,6 +301,7 @@ def demo():
             raise AssertionError(ruim)
         except ValueError:
             pass
+    assert fone_whats("(19) 3342-5050") == "551933425050" and fone_whats("123") == "" and fone_whats(None) == ""
     print("ok")
 
 

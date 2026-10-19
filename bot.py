@@ -82,7 +82,8 @@ def db():
         site TEXT, avaliacoes INTEGER, fonte TEXT, etapa TEXT DEFAULT 'prospectado',
         score INTEGER, diagnostico TEXT, mensagem TEXT, link_whatsapp TEXT, criado TEXT)""")
     cols = [r[1] for r in c.execute("PRAGMA table_info(leads)")]
-    for col in ("notas", "motivo"):
+    # envio: NULL | fila | enviado | falhou  (fila de contato automático pelo WhatsApp Web)
+    for col in ("notas", "motivo", "envio", "envio_msg", "envio_em", "envio_erro"):
         if col not in cols:
             c.execute(f"ALTER TABLE leads ADD COLUMN {col} TEXT")
     return c
