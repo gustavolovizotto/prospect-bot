@@ -398,7 +398,7 @@ function renderRun() {
           <section class="section">
             <label class="switch">
               <input type="checkbox" id="loop" ${f.loop ? "checked" : ""}><span class="trilho"></span>
-              <span><strong>Repetir a cada 6 horas</strong><small>Ideal para deixar rodando durante a noite. Só leads novos são adicionados.</small></span>
+              <span><strong>Repetir a cada ${b?.intervalo_horas ?? 2} horas</strong><small>Ideal para deixar rodando durante a noite. Só leads novos são adicionados.</small></span>
             </label>
           </section>
 
@@ -434,7 +434,7 @@ function renderProgresso() {
   if (!b || b.status === "ocioso") { el.innerHTML = ""; return; }
   const pct = b.total ? Math.round(((b.rodando && !b.aguardando ? b.atual - 1 : b.atual) / b.total) * 100) : 0;
   const decorrido = b.inicio ? duracao(Date.now() / 1000 - b.inicio) : "";
-  const titulo = b.aguardando ? "Rodada concluída · aguardando a próxima (6 h)"
+  const titulo = b.aguardando ? `Rodada concluída · próxima em até ${b.intervalo_horas} h`
     : b.rodando ? `Buscando ${b.atual} de ${b.total}`
     : b.status === "concluido" ? "Prospecção concluída" : "Prospecção interrompida";
   const icone = b.rodando && !b.aguardando ? "ph-circle-notch girando" : b.aguardando ? "ph-clock" : b.status === "concluido" ? "ph-check-circle" : "ph-pause";

@@ -16,7 +16,7 @@ git clone <este repo> && cd <pasta>
 O painel abre em **http://localhost:8765**. Enquanto ele estiver aberto, o computador não dorme.
 
 1. Em **Nova prospecção**, preencha **Seu perfil** (nome, como você se apresenta e portfólio). Esses dados entram nas mensagens.
-2. Escolha as cidades, os nichos e a fonte de dados. Para deixar rodando à noite, ligue **Repetir a cada 6 horas**.
+2. Escolha as cidades, os nichos e a fonte de dados. Para deixar rodando à noite, ligue **Repetir a cada 2 horas** (o intervalo fica em `INTERVALO_HORAS`, no `bot.py`).
 3. Clique em **Iniciar prospecção**. O progresso aparece ao vivo e os leads surgem na lista lateral.
 4. Na lista, os leads ficam separados em quentes, mornos e frios. Cada lead mostra diagnóstico, como negociar,
    o que propor, a mensagem (editável), a etapa do funil, as notas e o motivo quando for descartado ou perdido.

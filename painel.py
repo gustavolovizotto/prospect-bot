@@ -103,6 +103,7 @@ def estado_bot():
         "avisos": sum("falhou" in l for l in linhas),
         "log": linhas[-40:],
         "nichos": [{"id": k, "rotulo": v["rotulo"]} for k, v in bot.NICHOS.items()],
+        "intervalo_horas": bot.INTERVALO_HORAS,
     }
 
 

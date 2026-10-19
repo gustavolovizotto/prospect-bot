@@ -13,6 +13,7 @@ import argparse, csv, json, os, re, sqlite3, subprocess, sys, time, urllib.parse
 from datetime import datetime
 
 UA = "lp-prospector/0.1 (prospeccao local)"
+INTERVALO_HORAS = 2  # pausa entre rodadas no modo --loop
 RAIZ = os.path.dirname(os.path.abspath(__file__))
 DB = os.path.join(RAIZ, "leads.db")
 CONFIG = os.path.join(RAIZ, "config.json")  # perfil do vendedor e chave do Google (local, fora do git)
@@ -349,7 +350,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--cidades", default="Campinas")
     ap.add_argument("--nichos", default=",".join(NICHOS))
-    ap.add_argument("--loop", action="store_true", help="repete a cada 6h (pega lugares novos/mudanças)")
+    ap.add_argument("--loop", action="store_true", help=f"repete a cada {INTERVALO_HORAS}h, adicionando só leads novos")
     ap.add_argument("--export", action="store_true")
     ap.add_argument("--test", action="store_true")
     a = ap.parse_args()
@@ -362,6 +363,6 @@ if __name__ == "__main__":
             if not a.loop:
                 break
             exportar(c)
-            log("rodada completa, dormindo 6h")
-            time.sleep(6 * 3600)
+            log(f"rodada completa, dormindo {INTERVALO_HORAS}h")  # o painel detecta "dormindo"
+            time.sleep(INTERVALO_HORAS * 3600)
     exportar(c)
