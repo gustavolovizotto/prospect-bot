@@ -448,7 +448,8 @@ def mensagem(lead, perfil=None, hora=None):
              f"Um site objetivo, com {n['itens']}, ajuda a transformar essas buscas em {n['conversao']}.")
     assinatura = seu_nome + (f"\n{p['portfolio'].strip()}" if (p.get("portfolio") or "").strip() else "")
 
-    return (f"{saudacao(hora)}, tudo bem? Meu nome é {seu_nome}, sou {funcao} e trabalho com sites para "
+    # 1º parágrafo = abertura curta, enviada sozinha antes (vence o menu automático de chatbots)
+    return (f"{saudacao(hora)}, tudo bem?\n\nMeu nome é {seu_nome}, sou {funcao} e trabalho com sites para "
             f"{n['segmento']} aqui da região.\n\n{obs}\n\n{valor}\n\n"
             "Posso montar uma proposta enxuta para o caso de vocês e enviar por aqui, sem compromisso?\n\n"
             f"Se não for o momento, sem problema. Agradeço a atenção.\n{assinatura}")
@@ -588,7 +589,7 @@ def demo():
     assert [saudacao(h) for h in (0, 5, 11, 12, 17, 18, 23)] == ["Boa noite", "Bom dia", "Bom dia", "Boa tarde", "Boa tarde", "Boa noite", "Boa noite"]
     m = mensagem({"nome": "Oralcamp", "nicho": "dentista", "diagnostico": "sem https, não é mobile", "site": "https://www.x.com.br/"},
                  {"nome": "Gustavo", "portfolio": "gustavo.dev"}, hora=9)
-    assert m.startswith("Bom dia") and "Gustavo" in m and "(x.com.br)" in m and "“Não seguro” no navegador e não se adapta" in m, m
+    assert m.startswith("Bom dia, tudo bem?\n\nMeu nome é") and "Gustavo" in m and "(x.com.br)" in m and "“Não seguro” no navegador e não se adapta" in m, m
     assert "[seu nome]" in mensagem({"nome": "A", "nicho": "pet", "diagnostico": "sem site"})
     for k, n in NICHOS.items():  # toda entrada precisa dos campos usados na mensagem e na qualificação
         assert {"osm", "busca", "rotulo", "segmento", "publico", "escolha", "conversao", "itens", "proposta"} <= n.keys(), k

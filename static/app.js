@@ -652,7 +652,7 @@ function renderContato() {
       </ul>
       <div class="comando">
         <div><strong>Pronto para enviar</strong>
-          <span>Abre cada conversa no WhatsApp Web com a mensagem pronta. Você aperta Enter lá; o painel não consegue enviar sozinho.</span></div>
+          <span>Abre cada conversa no WhatsApp Web em duas etapas: primeiro a saudação, depois a proposta. Você aperta Enter lá; o painel não consegue enviar sozinho.</span></div>
         <button class="btn accent grande" id="iniciarSeq"><i class="ph ph-play-circle"></i>Abrir conversas em sequência</button>
       </div>
       <p class="hint">Envio automático (sem apertar Enter): peça ao Claude no chat <code id="cmdTxt">Envie a fila de contato automático</code>
@@ -661,6 +661,11 @@ function renderContato() {
 
     <section class="section">
       <h2><i class="ph ph-list-checks"></i>Selecionar leads</h2>
+      ${(() => { const q = base.filter((l) => temperatura(l) === "quente").length;
+        return `<div class="filtrar">
+          <div><strong>Filtrar</strong><span>Coloca na fila todos os leads quentes com celular ou WhatsApp que ainda não foram contatados.</span></div>
+          <button class="btn accent" id="filtrar" ${q ? "" : "disabled"}><i class="ph ph-funnel"></i>Filtrar${q ? ` (${q})` : ""}</button>
+        </div>`; })()}
       <div class="sel-filtros">
         <div class="tabs mini">${TEMPS.map(([k, nome]) => `
           <button class="tab" data-ctemp="${k}" aria-selected="${estado.cf.temp === k}">${k ? `<span class="dot ${k}"></span>` : ""}${nome}<span class="count">${conta[k]}</span></button>`).join("")}
@@ -718,6 +723,19 @@ function ligarContato(lista, marcados) {
     rerender();
   }));
   $("#desmarcar").addEventListener("click", () => { estado.marcados.clear(); rerender(); });
+  $("#filtrar")?.addEventListener("click", async () => {
+    const ids = estado.leads.filter((l) => elegivel(l) && temperatura(l) === "quente").map((l) => l.id);
+    if (!ids.length) return;
+    try {
+      estado.fila = await api("/api/fila", { ids, acao: "adicionar" });
+      await carregarLeads();
+      const total = estado.fila.itens.filter((i) => i.envio === "fila").length + estado.fila.enviados_hoje;
+      toast(`${ids.length} leads quentes na fila` + (total > LIMITE_DIA ? ` · acima de ${LIMITE_DIA} hoje, considere dividir em dias` : ""),
+            total > LIMITE_DIA ? "warning" : "check-circle");
+      renderStatusSidebar();
+      rerender();
+    } catch (e) { toast(e.message, "warning-circle"); }
+  });
   $("#enfileirar").addEventListener("click", async () => {
     try {
       estado.fila = await api("/api/fila", { ids: marcados, acao: "adicionar" });
@@ -754,13 +772,21 @@ async function iniciarSequencia() {
   const ids = estado.fila.itens.filter((i) => i.envio === "fila").map((i) => i.id);
   if (!ids.length) return;
   try { estado.fila = await api("/api/fila", { ids, acao: "adicionar" }); } catch {}  // recalcula a saudação para agora
-  estado.seq = { ids, i: 0, aberto: false, confirmado: false, espera: 0, enviados: 0, pulados: 0 };
+  estado.seq = { ids, i: 0, passo: 0, okSaudacao: false, confirmado: false, espera: 0, esperaResp: 0, enviados: 0, pulados: 0 };
   renderSeq();
 }
 
 function itemSeq() {
   const q = estado.seq;
   return q && estado.fila.itens.find((x) => x.id === q.ids[q.i]);
+}
+
+// Mensagem em duas partes: a saudação vai sozinha primeiro. Muitos números têm chatbot que só
+// responde o menu à primeira mensagem; a proposta chega depois, já fora do menu automático.
+const ESPERA_RESPOSTA = 20;  // segundos entre a saudação e a proposta
+function partes(msg) {
+  const m = (msg || "").match(/^([^\n]*?tudo bem\?)\s*/);
+  return m ? { saudacao: m[1], proposta: msg.slice(m[0].length) } : { saudacao: "Oi, tudo bem?", proposta: msg || "" };
 }
 
 function renderSeq() {
@@ -770,6 +796,23 @@ function renderSeq() {
   if (!el) { el = document.createElement("div"); el.id = "seq"; el.className = "seq-fundo"; document.body.append(el); }
   const it = itemSeq();
   const fim = q.i >= q.ids.length;
+  const p = partes(it?.envio_msg);
+  const passo = q.passo || 0;  // 0 abrir saudação · 1 saudação aberta · 2 proposta aberta
+  const cls = (n) => (passo > n || (n === 1 && q.okSaudacao && !q.esperaResp) ? "feito" : passo === n ? "atual" : "");
+  let acao;
+  if (passo === 0) {
+    acao = q.espera > 0
+      ? `<button class="btn accent" disabled><i class="ph ph-timer"></i>Próximo em ${q.espera}s</button>`
+      : `<button class="btn primary" data-abrir="saudacao"><i class="ph ph-whatsapp-logo"></i>Abrir saudação</button>`;
+  } else if (passo === 1) {
+    acao = `<button class="btn" data-abrir="saudacao"><i class="ph ph-arrow-square-out"></i>Abrir de novo</button>` + (
+      !q.okSaudacao ? `<button class="btn accent" disabled><i class="ph ph-chat-circle-dots"></i>Abrir proposta</button>`
+      : q.esperaResp > 0 ? `<button class="btn accent" disabled><i class="ph ph-timer"></i>Proposta em ${q.esperaResp}s</button>`
+      : `<button class="btn primary" data-abrir="proposta"><i class="ph ph-whatsapp-logo"></i>Abrir proposta</button>`);
+  } else {
+    acao = `<button class="btn" data-abrir="proposta"><i class="ph ph-arrow-square-out"></i>Abrir de novo</button>
+      <button class="btn accent" id="seqEnviei" ${q.confirmado ? "" : "disabled"}><i class="ph ph-check"></i>Enviei, próximo</button>`;
+  }
   el.innerHTML = `
   <div class="seq" role="dialog" aria-modal="true" aria-labelledby="seqTitulo">
     <div class="seq-head">
@@ -781,42 +824,50 @@ function renderSeq() {
     ${fim ? `
     <div class="seq-fim">
       <i class="ph-fill ph-flag-checkered"></i>
-      <p><strong>${q.enviados}</strong> ${q.enviados === 1 ? "mensagem enviada" : "mensagens enviadas"}${q.pulados ? ` · <strong>${q.pulados}</strong> sem WhatsApp` : ""}</p>
+      <p><strong>${q.enviados}</strong> ${q.enviados === 1 ? "lead contatado" : "leads contatados"}${q.pulados ? ` · <strong>${q.pulados}</strong> sem WhatsApp` : ""}</p>
       <button class="btn accent" id="seqOk">Concluir</button>
     </div>` : `
     <div class="seq-lead">
       <strong>${esc(it?.nome || "")}</strong>
       <span>${esc(nicho(it?.nicho || ""))} · ${esc(it?.cidade || "")} · ${esc(it?.telefone || "")}</span>
     </div>
-    <pre class="fila-msg seq-msg">${esc(it?.envio_msg || "")}</pre>
+    <div class="seq-saudacao ${passo >= 1 ? "usada" : ""}"><span>1ª mensagem</span>${esc(p.saudacao)}</div>
+    <pre class="fila-msg seq-msg ${passo === 2 ? "" : "apagada"}">${esc(p.proposta)}</pre>
     <ol class="seq-passos">
-      <li class="${q.aberto ? "feito" : "atual"}">Abra a conversa no WhatsApp Web</li>
-      <li class="${q.aberto ? "atual" : ""}">Confira a mensagem e aperte <kbd>Enter</kbd> lá</li>
-      <li class="${q.confirmado ? "feito" : ""}">Volte aqui e confirme que a mensagem saiu</li>
+      <li class="${cls(0)}">Abra e envie a saudação</li>
+      <li class="${cls(1)}">Espere a resposta (ou o menu do robô)</li>
+      <li class="${passo === 2 ? (q.confirmado ? "feito" : "atual") : ""}">Abra e envie a proposta</li>
     </ol>
-    ${q.aberto ? `
+    ${passo === 1 ? `
+    <label class="seq-confirma"><input type="checkbox" id="seqOkSaudacao" ${q.okSaudacao ? "checked" : ""}>
+      <span>Enviei a saudação</span></label>` : ""}
+    ${passo === 2 ? `
     <label class="seq-confirma"><input type="checkbox" id="seqConfirma" ${q.confirmado ? "checked" : ""}>
-      <span>Apertei Enter e a mensagem apareceu na conversa</span></label>` : ""}
+      <span>A proposta apareceu na conversa</span></label>` : ""}
     <div class="seq-acoes">
       <button class="btn" id="seqPular" title="O WhatsApp avisou que o número não tem conta"><i class="ph ph-skip-forward"></i>Pular: sem WhatsApp</button>
-      ${q.aberto
-        ? `<button class="btn" id="seqAbrir"><i class="ph ph-arrow-square-out"></i>Abrir de novo</button>
-           <button class="btn accent" id="seqEnviei" ${q.confirmado ? "" : "disabled"} title="Marque a confirmação acima para liberar"><i class="ph ph-check"></i>Enviei, próximo</button>`
-        : q.espera > 0
-          ? `<button class="btn accent" disabled><i class="ph ph-timer"></i>Próximo em ${q.espera}s</button>`
-          : `<button class="btn primary" id="seqAbrir"><i class="ph ph-whatsapp-logo"></i>Abrir no WhatsApp</button>`}
+      ${acao}
     </div>`}
   </div>`;
   ligarSeq();
 }
 
-function abrirConversa() {
+function abrirConversa(qual) {
   const it = itemSeq();
   if (!it) return;
-  const url = `https://web.whatsapp.com/send?phone=${it.whatsapp}&text=${encodeURIComponent(it.envio_msg)}`;
-  window.open(url, ABA_WHATS);  // mesmo nome = reaproveita a aba, sem abrir uma nova por lead
-  estado.seq.aberto = true;
+  const texto = partes(it.envio_msg)[qual];
+  window.open(`https://web.whatsapp.com/send?phone=${it.whatsapp}&text=${encodeURIComponent(texto)}`, ABA_WHATS);  // mesma aba
+  estado.seq.passo = qual === "saudacao" ? 1 : 2;
   renderSeq();
+}
+
+function contagem(q, campo) {
+  clearInterval(q.timer);
+  q.timer = setInterval(() => {
+    q[campo]--;
+    if (q[campo] <= 0) clearInterval(q.timer);
+    if (estado.seq === q) renderSeq();
+  }, 1000);
 }
 
 async function registrar(status) {
@@ -825,15 +876,10 @@ async function registrar(status) {
     await api("/api/fila/resultado", { id: it.id, status, erro: status === "falhou" ? "Número sem WhatsApp" : "" });
   } catch (e) { toast(e.message, "warning-circle"); return; }
   status === "enviado" ? q.enviados++ : q.pulados++;
-  q.i++; q.aberto = false; q.confirmado = false;
+  Object.assign(q, { i: q.i + 1, passo: 0, okSaudacao: false, confirmado: false, esperaResp: 0 });
   q.espera = status === "enviado" && q.i < q.ids.length ? INTERVALO_ENVIO : 0;
   renderSeq();
-  clearInterval(q.timer);
-  if (q.espera) q.timer = setInterval(() => {
-    q.espera--;
-    if (q.espera <= 0) clearInterval(q.timer);
-    if (estado.seq === q) renderSeq();
-  }, 1000);
+  if (q.espera) contagem(q, "espera");
   carregarFila().then(() => estado.view === "contato" && renderContato()).catch(() => {});
 }
 
@@ -845,11 +891,18 @@ function fecharSeq() {
 }
 
 function ligarSeq() {
+  const q = estado.seq;
   $("#seqFechar")?.addEventListener("click", fecharSeq);
   $("#seqOk")?.addEventListener("click", fecharSeq);
-  $("#seqAbrir")?.addEventListener("click", abrirConversa);
-  $("#seqConfirma")?.addEventListener("change", (e) => { estado.seq.confirmado = e.target.checked; renderSeq(); });
-  $("#seqEnviei")?.addEventListener("click", () => estado.seq.confirmado && registrar("enviado"));
+  document.querySelectorAll("[data-abrir]").forEach((b) => b.addEventListener("click", () => abrirConversa(b.dataset.abrir)));
+  $("#seqOkSaudacao")?.addEventListener("change", (e) => {
+    q.okSaudacao = e.target.checked;
+    q.esperaResp = q.okSaudacao ? ESPERA_RESPOSTA : 0;
+    renderSeq();
+    if (q.esperaResp) contagem(q, "esperaResp");
+  });
+  $("#seqConfirma")?.addEventListener("change", (e) => { q.confirmado = e.target.checked; renderSeq(); });
+  $("#seqEnviei")?.addEventListener("click", () => q.confirmado && registrar("enviado"));
   $("#seqPular")?.addEventListener("click", () => {
     if (confirm("Marcar este lead como sem WhatsApp e pular?")) registrar("falhou");
   });
