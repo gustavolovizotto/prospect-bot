@@ -167,7 +167,7 @@ function renderStatusSidebar() {
   btn.querySelector(".run-ico i").className = b?.rodando && !b.aguardando ? "ph ph-circle-notch girando" : "ph ph-rocket-launch";
 
   const andamento = estado.leads.filter((l) => l.quadro_em && !["fechado", "perdido", "descartado"].includes(l.etapa)).length;
-  $("#abrirQuadro").classList.toggle("ativo", estado.view === "quadro");
+  $("#abrirQuadro").classList.toggle("ativo", ["quadro", "reengajar"].includes(estado.view));
   const vencidos = estado.leads.filter((l) => l.quadro_em && !["fechado", "perdido", "descartado"].includes(l.etapa)
     && ((l.proximo_em && l.proximo_em <= hoje()) || l.reeng === "fila")).length;  // próximo passo vencido ou na fila de reengajamento
   $("#quadroStatus").textContent = !andamento ? "Leads que responderam"
@@ -1056,6 +1056,7 @@ function renderQuadro() {
   const noQuadro = estado.leads.filter((l) => l.quadro_em);
   const perdidos = noQuadro.filter((l) => colunaDe(l) === "perdido").length;
   const cols = [...COLUNAS, ...(estado.verPerdidos && perdidos ? ["perdido"] : [])];
+  const ativos = noQuadro.filter((l) => ANDAMENTO.includes(l.etapa)), naFila = ativos.filter((l) => l.reeng === "fila").length;
   $("#detalhe").innerHTML = `
   <div class="wrap largo">
     <button class="btn voltar" data-voltar><i class="ph ph-arrow-left"></i>Leads</button>
@@ -1065,10 +1066,12 @@ function renderQuadro() {
         <h1>Dashboard</h1>
         <p class="lead-txt">Leads que aceitaram o primeiro contato. Arraste o card para mudar a etapa e clique nele para ver tudo do lead.</p>
       </div>
-      ${perdidos ? `<button class="btn" id="verPerdidos" aria-pressed="${estado.verPerdidos}"><i class="ph ph-archive"></i>${estado.verPerdidos ? "Esconder perdidos" : `Perdidos (${perdidos})`}</button>` : ""}
+      <div class="head-acoes">
+        ${ativos.length ? `<button class="btn" id="abrirReeng"><i class="ph ph-arrow-counter-clockwise"></i>Reengajamento${naFila ? ` <span class="count">${naFila}</span>` : ""}</button>` : ""}
+        ${perdidos ? `<button class="btn" id="verPerdidos" aria-pressed="${estado.verPerdidos}"><i class="ph ph-archive"></i>${estado.verPerdidos ? "Esconder perdidos" : `Perdidos (${perdidos})`}</button>` : ""}
+      </div>
     </div>
     ${renderNumeros()}
-    ${renderReengajar(noQuadro)}
     ${noQuadro.length ? `
     <div class="quadro" style="--cols:${cols.length}">${cols.map((c) => {
       const ls = noQuadro.filter((l) => colunaDe(l) === c), soma = ls.reduce((t, l) => t + reais(l.valor), 0);
@@ -1091,8 +1094,9 @@ function renderQuadro() {
 }
 
 // ---------- reengajamento ----------
-// O Claude confere no WhatsApp Web a última mensagem de cada lead do dashboard (conversa_*) e monta a fila com a
-// mensagem sugerida (rotinas/reengajar.md). Aqui você revisa, edita e envia, como na fila de primeiro contato.
+// Tela própria, aberta pelo botão Reengajamento do dashboard. O botão Atualizar faz o painel chamar o Claude, que lê
+// no WhatsApp Web a lista e o histórico de cada lead (conversa_*) e monta a fila com a mensagem sugerida (a rotina
+// das 20h faz o mesmo: rotinas/reengajar.md). Aqui você revisa, edita e envia, como na fila de primeiro contato.
 const ANDAMENTO = ["respondeu", "prototipo", "proposta", "negociando"];
 const diasData = (d) => Math.round((new Date(hoje()) - new Date(d.slice(0, 10))) / 864e5);
 const quando = (n) => (n <= 0 ? "hoje" : n === 1 ? "ontem" : `há ${n} dias`);
@@ -1102,52 +1106,112 @@ const ultimaMsg = (l) => !l.conversa_em ? "" : l.conversa_de === "eu"
   : `Mensagem dele ${quando(diasData(l.conversa_em))} · a vez é sua`;
 const linkWhats = (l) => `https://web.whatsapp.com/send?phone=${foneWhats(l)}&text=${encodeURIComponent(l.reeng_msg || "")}`;
 
-function renderReengajar(noQuadro) {
-  const ativos = noQuadro.filter((l) => ANDAMENTO.includes(l.etapa));
-  if (!ativos.length) return "";
-  const fila = ativos.filter((l) => l.reeng === "fila");
-  const parados = ativos.filter((l) => l.reengajar?.pronto || (l.reengajar?.esgotado && l.reengajar.parado >= (pvAtivo()?.contato.reengajamento.dias ?? 3)));
+function statusReeng() {
+  const a = estado.reengAt || {}, ativos = estado.leads.filter((l) => l.quadro_em && ANDAMENTO.includes(l.etapa));
   const conferido = ativos.map((l) => l.conversa_conferida_em).filter(Boolean).sort().pop();
-  return `
-  <section class="section reengajar" id="reengajar">
-    <h2><i class="ph ph-arrow-counter-clockwise"></i>Fila de reengajamento <span class="count-h">${fila.length}</span>
-      <span class="h2-acoes reeng-conferido">${conferido ? `WhatsApp conferido em ${dataHora(conferido)}` : "WhatsApp ainda não conferido"}</span></h2>
-    ${fila.length ? `
-    <div class="reeng-lista">${fila.map((l) => `
-      <div class="reeng" data-id="${esc(l.id)}">
-        <div class="reeng-topo">
-          <button class="link reeng-nome" data-abrir>${esc(l.nome)}</button>
-          <span class="reeng-meta">${ultimaMsg(l)}${l.reengajamentos ? ` · ${l.reengajamentos + 1}ª tentativa` : ""}</span>
-        </div>
-        <textarea class="area" rows="4" data-editar aria-label="Mensagem para ${esc(l.nome)}">${esc(l.reeng_msg)}</textarea>
-        <div class="reeng-acoes">
-          <button class="icon-btn" data-tirar title="Tirar da fila" aria-label="Tirar ${esc(l.nome)} da fila"><i class="ph ph-x"></i></button>
-          <a class="btn primary" data-whats href="${esc(linkWhats(l))}" target="${ABA_WHATS}" rel="noopener"><i class="ph ph-whatsapp-logo"></i>Abrir no WhatsApp</a>
-          <button class="btn accent" data-enviei><i class="ph ph-check"></i>Enviei</button>
-        </div>
-      </div>`).join("")}
-    </div>` : `<p class="ok-site">Ninguém na fila agora.</p>`}
-    ${parados.length ? `
-    <div class="reeng-parados">${parados.map((l) => `
+  const hora = (t) => new Date(t * 1000).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" });
+  if (a.rodando) return `<div class="aviso info"><i class="ph ph-circle-notch girando"></i><span>O Claude está lendo o WhatsApp Web no Chrome desde ${hora(a.inicio)}. Leva alguns minutos; deixe o Chrome aberto.</span></div>`;
+  if (a.erro) return `<div class="aviso"><i class="ph ph-warning-circle"></i><span>Não deu para atualizar: ${esc(a.erro)}</span></div>`;
+  if (a.resumo) return `<div class="aviso info"><i class="ph ph-check-circle"></i><span>Atualizado às ${hora(a.fim)}. ${esc(a.resumo)}</span></div>`;
+  return `<p class="hint">${conferido ? `WhatsApp conferido em ${dataHora(conferido)}.` : "WhatsApp ainda não conferido."} Clique em <strong>Atualizar</strong> para o Claude ler as conversas e sugerir as mensagens.</p>`;
+}
+
+function renderReengajar() {
+  const ativos = estado.leads.filter((l) => l.quadro_em && ANDAMENTO.includes(l.etapa));
+  const fila = ativos.filter((l) => l.reeng === "fila");
+  const parados = ativos.filter((l) => l.reeng !== "fila" && (l.reengajar?.pronto || (l.reengajar?.esgotado && l.reengajar.parado >= (pvAtivo()?.contato.reengajamento.dias ?? 3))));
+  const outros = ativos.filter((l) => !fila.includes(l) && !parados.includes(l));
+  const rodando = !!estado.reengAt?.rodando;
+  const linha = (l, extra = "") => `
       <div class="reeng-linha" data-id="${esc(l.id)}">
         <button class="link reeng-nome" data-abrir>${esc(l.nome)}</button>
-        <span class="reeng-meta">${ultimaMsg(l)}</span>
-        ${l.reengajar.esgotado ? `<span class="reeng-meta">${l.reengajamentos} tentativas sem resposta</span><button class="btn" data-perdido><i class="ph ph-archive"></i>Mover para Perdido</button>`
-          : l.reengajar.sugestao ? `<button class="btn" data-adicionar><i class="ph ph-plus"></i>Adicionar com a mensagem do perfil</button>` : ""}
-      </div>`).join("")}
-    </div>` : ""}
-    <p class="hint">Para conferir o WhatsApp e montar a fila com mensagens sugeridas para cada conversa, peça ao Claude no chat
-      <code id="cmdReeng">Monte a fila de reengajamento</code> <button class="link" id="copiarReeng">copiar</button>. A rotina das 20h também faz isso.
-      Para ele enviar a fila: <code>Envie a fila de reengajamento</code>.</p>
-  </section>`;
+        <span class="reeng-meta">${ultimaMsg(l) || "Conversa ainda não conferida"}</span>${extra}
+      </div>`;
+  $("#detalhe").innerHTML = `
+  <div class="wrap">
+    <button class="btn voltar-dash" data-abrir-quadro><i class="ph ph-arrow-left"></i>Dashboard</button>
+    <div class="head">
+      <div>
+        <div class="eyebrow">Dashboard</div>
+        <h1>Reengajamento</h1>
+        <p class="lead-txt">Leads do dashboard que pararam de responder. O Claude lê as conversas no WhatsApp Web e sugere a próxima mensagem; você revisa, edita e envia.</p>
+      </div>
+      <button class="btn primary" id="atualizarReeng" ${rodando ? "disabled" : ""}><i class="ph ${rodando ? "ph-circle-notch girando" : "ph-arrows-clockwise"}"></i>${rodando ? "Atualizando…" : "Atualizar"}</button>
+    </div>
+    <div id="reengStatus">${statusReeng()}</div>
+    <section class="section reengajar" id="reengajar">
+      <h2><i class="ph ph-paper-plane-tilt"></i>Fila de reengajamento <span class="count-h">${fila.length}</span></h2>
+      ${fila.length ? `
+      <div class="reeng-lista">${fila.map((l) => `
+        <div class="reeng" data-id="${esc(l.id)}">
+          <div class="reeng-topo">
+            <button class="link reeng-nome" data-abrir>${esc(l.nome)}</button>
+            <span class="reeng-meta">${ultimaMsg(l)}${l.reengajamentos ? ` · ${l.reengajamentos + 1}ª tentativa` : ""}</span>
+          </div>
+          ${l.conversa_previa ? `<p class="reeng-previa">“${esc(l.conversa_previa)}”</p>` : ""}
+          <textarea class="area" rows="4" data-editar aria-label="Mensagem para ${esc(l.nome)}">${esc(l.reeng_msg)}</textarea>
+          <div class="reeng-acoes">
+            <button class="icon-btn" data-tirar title="Tirar da fila" aria-label="Tirar ${esc(l.nome)} da fila"><i class="ph ph-x"></i></button>
+            <a class="btn primary" data-whats href="${esc(linkWhats(l))}" target="${ABA_WHATS}" rel="noopener"><i class="ph ph-whatsapp-logo"></i>Abrir no WhatsApp</a>
+            <button class="btn accent" data-enviei><i class="ph ph-check"></i>Enviei</button>
+          </div>
+        </div>`).join("")}
+      </div>` : `<p class="ok-site">Ninguém na fila agora.</p>`}
+    </section>
+    ${parados.length ? `
+    <section class="section reengajar">
+      <h2><i class="ph ph-hourglass"></i>Parados <span class="count-h">${parados.length}</span></h2>
+      <div class="reeng-parados">${parados.map((l) => linha(l, l.reengajar.esgotado
+        ? `<span class="reeng-meta">${l.reengajamentos} tentativas sem resposta</span><button class="btn" data-perdido><i class="ph ph-archive"></i>Mover para Perdido</button>`
+        : l.reengajar.sugestao ? `<button class="btn" data-adicionar><i class="ph ph-plus"></i>Adicionar com a mensagem do perfil</button>` : "")).join("")}
+      </div>
+    </section>` : ""}
+    ${outros.length ? `
+    <section class="section reengajar">
+      <h2><i class="ph ph-chats-circle"></i>Em andamento <span class="count-h">${outros.length}</span></h2>
+      <div class="reeng-parados">${outros.map((l) => linha(l)).join("")}</div>
+    </section>` : ""}
+    <p class="hint">O <strong>Atualizar</strong> abre o WhatsApp Web numa aba do Chrome (extensão Claude in Chrome), lê a lista e o histórico de cada conversa e
+      põe na fila quem está parado há ${pvAtivo()?.contato.reengajamento.dias ?? 3} dias ou mais. Conversa com mensagem não lida fica só pela prévia, para não marcar como lida.
+      Nada é enviado. Para o Claude enviar a fila, peça no chat: <code>Envie a fila de reengajamento</code>.</p>
+  </div>`;
+  ligarReengajar();
+}
+
+let reengTimer;
+function acompanharReeng() {  // enquanto o Claude lê o WhatsApp, só o aviso muda; no fim, recarrega a tela
+  clearTimeout(reengTimer);
+  reengTimer = setTimeout(async () => {
+    try { estado.reengAt = (await api("/api/reengajar")).atualizacao; } catch { return acompanharReeng(); }
+    if (estado.reengAt.rodando) {
+      if (estado.view === "reengajar") $("#reengStatus").innerHTML = statusReeng();
+      return acompanharReeng();
+    }
+    await carregarLeads().catch(() => {});
+    renderStatusSidebar();
+    if (estado.view === "reengajar") renderReengajar();
+    else toast(estado.reengAt.erro ? "Reengajamento não atualizado" : "Reengajamento atualizado", estado.reengAt.erro ? "warning-circle" : "check-circle");
+  }, 4000);
+}
+
+async function abrirReengajar() {
+  estado.view = "reengajar";
+  try { estado.reengAt = (await api("/api/reengajar")).atualizacao; } catch {}
+  renderStatusSidebar();
+  renderReengajar();
+  $("#detalhe").scrollTop = 0;
+  if (estado.reengAt?.rodando) acompanharReeng();
 }
 
 function ligarReengajar() {
-  const sec = $("#reengajar");
-  if (!sec) return;
+  const tela = $("#detalhe");
   const lead = (el) => estado.leads.find((x) => x.id === el.closest("[data-id]").dataset.id);
-  const feito = async (aviso) => { await carregarLeads(); renderQuadro(); renderStatusSidebar(); toast(aviso); };
-  sec.addEventListener("click", async (e) => {
+  const feito = async (aviso) => { await carregarLeads(); renderReengajar(); renderStatusSidebar(); toast(aviso); };
+  $("#atualizarReeng").addEventListener("click", async () => {
+    try { estado.reengAt = await api("/api/reengajar/atualizar", {}); renderReengajar(); acompanharReeng(); }
+    catch (err) { toast(err.message, "warning-circle"); }
+  });
+  tela.querySelectorAll(".reengajar").forEach((sec) => sec.addEventListener("click", async (e) => {
     const b = e.target.closest("[data-abrir], [data-tirar], [data-enviei], [data-adicionar], [data-perdido]");
     if (!b) return;
     const l = lead(b);
@@ -1159,8 +1223,8 @@ function ligarReengajar() {
       await api("/api/reengajar/resultado", { id: l.id, status: "enviado" });
       feito(`${l.nome}: reengajamento registrado`);
     } catch (err) { toast(err.message, "warning-circle"); }
-  });
-  sec.querySelectorAll("[data-editar]").forEach((t) => {  // salva o texto 700ms depois de parar de digitar
+  }));
+  tela.querySelectorAll("[data-editar]").forEach((t) => {  // salva o texto 700ms depois de parar de digitar
     let timer;
     t.addEventListener("input", () => {
       const l = lead(t);
@@ -1170,7 +1234,6 @@ function ligarReengajar() {
       timer = setTimeout(() => api("/api/reengajar", { ids: [l.id], acao: "editar", mensagem: t.value }).catch((err) => toast(err.message, "warning-circle")), 700);
     });
   });
-  $("#copiarReeng")?.addEventListener("click", async () => { await navigator.clipboard.writeText($("#cmdReeng").textContent); toast("Comando copiado"); });
 }
 
 // ---------- métricas ----------
@@ -1240,7 +1303,7 @@ async function moverCartao(id, coluna) {
 
 function ligarQuadro() {
   $("#verPerdidos")?.addEventListener("click", () => { estado.verPerdidos = !estado.verPerdidos; renderQuadro(); });
-  ligarReengajar();
+  $("#abrirReeng")?.addEventListener("click", abrirReengajar);
   const q = $(".quadro");
   if (!q) return;
   q.addEventListener("click", (e) => {

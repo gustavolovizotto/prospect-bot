@@ -755,6 +755,23 @@ Leads (JSON):
 {leads}"""
 
 
+def claude_exe():
+    exe = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+    return exe if os.path.exists(exe) else None
+
+
+def claude(prompt, args, timeout=900):
+    """Roda o Claude Code sem interface (claude -p) e devolve o texto da resposta. Erro dele vira exceção."""
+    # sem as variáveis de quem abriu o painel (ex.: o app do Claude): o claude usa o login dele
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "ANTHROPIC", "AI_AGENT"))}
+    r = subprocess.run([claude_exe() or "claude", "-p", prompt, "--output-format", "json", "--no-session-persistence", *args],
+                       capture_output=True, text=True, timeout=timeout, env=env, cwd=RAIZ)
+    res = json.loads((r.stdout.strip().splitlines() or ["{}"])[0])
+    if res.get("is_error") or "result" not in res:
+        raise IOError(res.get("result") or r.stderr.strip()[-300:] or "o Claude não respondeu")
+    return res["result"]
+
+
 def revisar_com_claude(c, ids, pv, lote=25):
     """Aplica as instruções em texto livre do perfil aos leads `ids`, chamando o Claude Code (claude -p).
     O bot não tem IA: quem entende "descarte quem já tem agendamento online" é o Claude. -> quantos descartou"""
@@ -762,12 +779,9 @@ def revisar_com_claude(c, ids, pv, lote=25):
                               (("prospeccao", "Prospecção"), ("qualificacao", "Qualificação")) if pv[k]["instrucoes"].strip())
     if not instrucoes or not ids:
         return 0
-    exe = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
-    if not os.path.exists(exe):
+    if not claude_exe():
         log("Claude Code não encontrado: as instruções do perfil não foram aplicadas")
         return 0
-    # sem as variáveis de quem abriu o painel (ex.: o app do Claude): o claude usa o login dele
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "ANTHROPIC", "AI_AGENT"))}
     c.row_factory = sqlite3.Row
     rows = [dict(r) for r in c.execute(
         f"SELECT id, nome, nicho, cidade, endereco, site, tel_tipo, avaliacoes, diagnostico, score FROM leads "
@@ -779,12 +793,8 @@ def revisar_com_claude(c, ids, pv, lote=25):
         log(f"Revisando {i + 1}-{i + len(parte)} de {len(rows)} leads novos com o Claude (instruções do perfil)")
         prompt = PROMPT_REVISAO.format(perfil=pv["nome"], instrucoes=instrucoes, leads=json.dumps(parte, ensure_ascii=False))
         try:
-            r = subprocess.run([exe, "-p", prompt, "--output-format", "json", "--tools", "WebFetch", "--allowedTools", "WebFetch",
-                                "--no-session-persistence"], capture_output=True, text=True, timeout=900, env=env, cwd=RAIZ)
-            res = json.loads(r.stdout.strip().splitlines()[0])
-            if res.get("is_error"):
-                raise IOError(res.get("result"))
-            decisoes = json.loads(re.search(r"\[.*\]", res["result"], re.S).group(0))
+            res = claude(prompt, ["--tools", "WebFetch", "--allowedTools", "WebFetch"])
+            decisoes = json.loads(re.search(r"\[.*\]", res, re.S).group(0))
         except Exception as e:
             log(f"  revisão falhou ({str(e)[:150]}): esses leads ficam como estão")
             continue

@@ -696,8 +696,12 @@ kbd { padding: 1px 6px; border: 1px solid var(--line-strong); border-bottom-widt
 }
 
 /* ---------- Reengajar (dashboard) ---------- */
-.reengajar { margin-bottom: 28px; }
-.reeng-conferido { margin-left: auto; font-size: 12px; font-weight: 400; color: var(--ink-3); }
+.head-acoes { display: flex; flex-wrap: wrap; gap: 8px; }
+.btn.voltar-dash { margin-bottom: 16px; }
+#reengStatus { margin-bottom: 24px; }
+.aviso.info { background: var(--sunken); }
+.aviso.info i { color: var(--ink-3); }
+.reeng-previa { margin: 0; font-size: 12.5px; color: var(--ink-2); font-style: italic; }
 .reeng-lista { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
 .reeng { display: grid; gap: 8px; padding: 12px 14px; border-bottom: 1px solid var(--line); }
 .reeng:last-child { border-bottom: 0; }
