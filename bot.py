@@ -283,12 +283,22 @@ def retry(fn, tentativas=4):
 
 
 # ---------- 1) prospecção ----------
+UF = {"AC": 12, "AL": 27, "AP": 16, "AM": 13, "BA": 29, "CE": 23, "DF": 53, "ES": 32, "GO": 52, "MA": 21, "MT": 51,
+      "MS": 50, "MG": 31, "PA": 15, "PB": 25, "PR": 41, "PE": 26, "PI": 22, "RJ": 33, "RN": 24, "RS": 43, "RO": 11,
+      "RR": 14, "SC": 42, "SP": 35, "SE": 28, "TO": 17}  # estado -> 2 primeiros dígitos do código IBGE do município
+
+
+def consulta_osm(cidade, filtro):
+    """Só municípios brasileiros (têm código IBGE), nunca bairro ou cidade de outro país com o mesmo nome.
+    "Bandeirantes/PR" escolhe o estado quando o nome se repete."""
+    nome, _, uf = cidade.replace('"', "").replace("\\", "").partition("/")
+    ibge = f'~"^{UF[uf.strip().upper()]}"' if uf.strip().upper() in UF else ""
+    return (f'[out:json][timeout:120];area["name"="{nome.strip()}"]["boundary"="administrative"]["admin_level"="8"]'
+            f'["IBGE:GEOCODIGO"{ibge}]->.a;nwr{filtro}["name"](area.a);out tags center;')
+
+
 def buscar_osm(cidade, nicho):
-    # ponytail: casa qualquer área com esse nome (ex.: bairro "Campinas" em SC); filtrar por DDD se incomodar
-    filtro = nicho_info(nicho)["osm"]
-    cidade = cidade.replace('"', "").replace("\\", "")
-    q = (f'[out:json][timeout:120];area["name"="{cidade}"]["boundary"="administrative"]->.a;'
-         f'nwr{filtro}["name"](area.a);out tags center;')
+    q = consulta_osm(cidade, nicho_info(nicho)["osm"])
     r = retry(lambda: json.loads(http("https://overpass-api.de/api/interpreter",
                                       urllib.parse.urlencode({"data": q}).encode(), timeout=180)[1]))
     for e in (r or {}).get("elements", []):
@@ -369,6 +379,8 @@ def sem_acento(s):
 def tipo_telefone(tel, whatsapp=False):
     """whatsapp (cadastrado como WhatsApp) | celular (11 dígitos com 9: quase sempre tem WhatsApp) | fixo | None"""
     d = re.sub(r"\D", "", tel or "")
+    if (tel or "").strip().startswith("+") and not d.startswith("55"):
+        return None  # número de outro país
     if d.startswith("55") and len(d) > 11:
         d = d[2:]
     d = d.lstrip("0")
@@ -851,6 +863,9 @@ def demo():
     assert link_whatsapp("123", "x") is None and link_whatsapp(None, "x") is None
     assert [tipo_telefone(t) for t in ("+55 19 99999-0000", "(19) 3342-5050", "123", None)] == ["celular", "fixo", None, None]
     assert tipo_telefone("19 3342-5050", whatsapp=True) == "whatsapp"
+    assert tipo_telefone("+34 900 000000") is None and tipo_telefone("+55 44 99999-0000") == "celular"
+    assert '["IBGE:GEOCODIGO"~"^41"]' in consulta_osm("Bandeirantes/PR", "") and '"name"="Bandeirantes"' in consulta_osm("Bandeirantes / pr", "")
+    assert '["IBGE:GEOCODIGO"]->' in consulta_osm("Astorga", "")
     assert desqualificar("UBS Jardim Aurélia") and desqualificar("Cobasi Cambuí") and desqualificar("Clínica X", 3)
     assert not desqualificar("Navarro Odontologia")
     assert completar({"id": "x", "qualificacao": {"pontos": {"fixo": 9}}})["qualificacao"]["pontos"]["whatsapp"] == 25
