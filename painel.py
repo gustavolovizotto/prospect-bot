@@ -4,29 +4,38 @@
 Servidor só-stdlib. Front em static/ (index.html, app.css, app.js).
 API:
   GET  /api/leads          -> {"leads", "etapas", "motivos"}
-  POST /api/lead           <- {"id", "etapa", "notas", "motivo"}
+  POST /api/lead           <- {"id", "etapa"?, "notas"?, "motivo"?, "prototipo"?, "valor"?, "quadro"?: bool}  (só o que vier)
   GET  /api/bot            -> estado da prospecção (rodando, progresso, log) + nichos
   POST /api/bot/iniciar    <- {"cidades": [...], "nichos": [...], "fonte": "osm"|"google", "loop": bool}
   POST /api/bot/parar
   GET  /api/config         -> {"perfil", "tem_google_key"}
   POST /api/config         <- {"perfil": {...}, "google_key"?: str}
   GET  /api/fila           -> leads na fila de envio, com telefone e mensagem congelada
-  POST /api/fila           <- {"ids": [...], "acao": "adicionar"|"remover"}
+  POST /api/fila           <- {"ids": [...], "acao": "adicionar"|"remover"|"editar", "mensagem"? (editar, 1 id)}
   POST /api/fila/resultado <- {"id", "status": "enviado"|"falhou", "erro"?}  (chamado por quem envia)
+  GET  /api/perfis         -> perfis de venda, o ativo, critérios, variáveis e prévia da mensagem de cada um
+  POST /api/perfis         <- {"acao": "salvar", "perfil": {...}} | {"acao": "ativar"|"excluir", "id"}
+  POST /api/nichos         <- {"acao": "criar", "nicho": {rotulo, busca, segmento, ticket}} | {"acao": "excluir", "id"}
+  POST /api/resposta       <- {"id", "tipo": "interesse"|"recusa"|"automatica", "texto"}  (rotina viu a resposta no WhatsApp)
+  GET  /api/followups      -> quem recebe o follow-up hoje, com a mensagem pronta
+  POST /api/followups      <- {"id", "status": "enviado"|"falhou", "erro"?}
 """
-import atexit, json, mimetypes, os, re, sqlite3, subprocess, sys, time
-from datetime import datetime
+import atexit, json, mimetypes, os, re, sqlite3, subprocess, sys, threading, time
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import bot
 
 RAIZ = bot.RAIZ
 STATIC = os.path.join(RAIZ, "static")
+BACKUPS = os.path.join(RAIZ, "backups")
 LOG = os.path.join(RAIZ, "run.log")
 PORTA = int(os.environ.get("PORTA", 8765))
-ETAPAS = ["abordagem_pronta", "qualificado", "contatado", "respondeu", "negociando", "fechado", "perdido", "descartado"]
+ETAPAS = ["abordagem_pronta", "qualificado", "contatado", "respondeu", "prototipo", "proposta", "negociando", "fechado",
+          "perdido", "descartado"]
+RESPONDEU = ("respondeu", "prototipo", "proposta", "negociando", "fechado")  # etapas de quem já respondeu
 MOTIVOS = ["Já tem site e está satisfeito", "Sem interesse", "Sem orçamento agora", "Contato inválido",
-           "Fechou com outro", "Não respondeu"]
+           "Fechou com outro", "Não respondeu", "Nunca contatar"]  # "Nunca contatar": contato pessoal, pedido para sair...
 
 # problema no diagnóstico -> (ícone Phosphor, por que importa)
 PROBLEMAS = {
@@ -62,20 +71,43 @@ def argumento(diag):
             "problemas": probs}
 
 
+def limpar_funil(c, ct):
+    """Tira do caminho quem não vai a lugar nenhum. Roda a cada leitura da lista, então vale também para o passado.
+    - número que o WhatsApp recusou -> descartado (Contato inválido)
+    - contatado pela fila há mais de `dias_sem_resposta` e ainda sem resposta marcada -> perdido (Não respondeu).
+      Com o follow-up ligado, o prazo conta a partir dele, e só depois que ele saiu.
+    `ct` é o "contato" do perfil em uso. ponytail: vale para todos os leads, mesmo os de outro perfil."""
+    c.execute("""UPDATE leads SET etapa='descartado', motivo='Contato inválido' WHERE envio='falhou'
+                 AND etapa IN ('abordagem_pronta', 'qualificado')
+                 AND (envio_erro LIKE '%não está no WhatsApp%' OR envio_erro LIKE '%sem WhatsApp%')""")
+    agora = datetime.now()
+    c.execute("UPDATE leads SET etapa='perdido', motivo='Não respondeu', etapa_em=? WHERE etapa='contatado' AND envio='enviado' AND "
+              + ("followup_em < ?" if ct["followup"]["ativo"] else "COALESCE(followup_em, envio_em) < ?"),
+              (agora.isoformat(timespec="seconds"), (agora - timedelta(days=ct["dias_sem_resposta"])).isoformat(timespec="seconds")))
+
+
 def leads():
     if not os.path.exists(bot.DB):
         return []
-    perfil = bot.carregar_config().get("perfil", {})
+    cfg = bot.carregar_config()
+    perfil, todos = cfg.get("perfil", {}), bot.perfis_venda(cfg)
     with bot.db() as c:
+        limpar_funil(c, bot.perfil_venda(None, cfg)["contato"])
         c.row_factory = sqlite3.Row
         rows = [dict(r) for r in c.execute(
             "SELECT * FROM leads ORDER BY score DESC, (link_whatsapp IS NULL), avaliacoes DESC")]
     for r in rows:
         diag = r["diagnostico"] or ""
-        r["argumento"] = argumento(diag)
-        r["proposta"] = bot.NICHOS.get(r["nicho"], {}).get("proposta", [])
-        r["mensagem"] = bot.mensagem(r, perfil)  # sempre com o perfil atual
-        r["temperatura"] = bot.temperatura(r["score"] or 0)
+        pv = todos.get(r["perfil_venda"]) or todos[bot.PADRAO]
+        landing = pv["id"] == bot.PADRAO  # "como negociar" e "o que propor" são da venda de landing pages
+        r["perfil_venda"] = pv["id"]
+        r["argumento"] = argumento(diag) if landing else {**argumento(diag), "dor": "", "pitch": ""}
+        r["proposta"] = bot.nicho_info(r["nicho"])["proposta"] if landing else []
+        if r["quadro_em"]:  # {prototipo} e {preco} ficam para a tela trocar pelo que você digitar
+            v = {**bot.variaveis(r, perfil), "prototipo": "{prototipo}", "preco": "{preco}"}
+            r["propostas"] = [{"titulo": x["titulo"], "texto": bot.preencher(x["texto"], v)} for x in pv["contato"]["propostas"]]
+        r["mensagem"] = bot.mensagem(r, perfil, pv=pv)  # sempre com seus dados atuais
+        r["temperatura"] = bot.temperatura(r["score"] or 0, pv)
         r["analise"] = json.loads(r["analise"]) if r["analise"] else []
         r["contatavel"] = r["tel_tipo"] in ("whatsapp", "celular")
     return rows
@@ -96,11 +128,12 @@ def fila():
         rows = [dict(r) for r in c.execute(
             "SELECT id, nome, nicho, cidade, telefone, score, envio, envio_msg, envio_em, envio_erro FROM leads "
             "WHERE envio IS NOT NULL ORDER BY envio='fila' DESC, envio_em DESC, score DESC")]
-        hoje = c.execute("SELECT COUNT(*) FROM leads WHERE envio='enviado' AND envio_em >= ?",
-                         (datetime.now().strftime("%Y-%m-%d"),)).fetchone()[0]
+        dia = datetime.now().strftime("%Y-%m-%d")
+        hoje = c.execute("SELECT (SELECT COUNT(*) FROM leads WHERE envio='enviado' AND envio_em >= ?) + "
+                         "(SELECT COUNT(*) FROM leads WHERE followup_em >= ?)", (dia, dia)).fetchone()[0]
     for r in rows:
         r["whatsapp"] = fone_whats(r["telefone"])
-    return {"itens": rows, "enviados_hoje": hoje, "limites": {"quente": bot.QUENTE, "morno": bot.MORNO}}
+    return {"itens": rows, "enviados_hoje": hoje}
 
 
 def mexer_fila(d):
@@ -111,19 +144,31 @@ def mexer_fila(d):
         with bot.db() as c:
             c.executemany("UPDATE leads SET envio=NULL, envio_msg=NULL WHERE id=? AND envio='fila'", [(i,) for i in ids])
         return
+    if d.get("acao") == "editar":  # a rotina ajusta o texto congelado seguindo as instruções de contato do perfil
+        texto = d.get("mensagem")
+        abertura, _, resto = (texto or "").strip().partition("\n\n") if isinstance(texto, str) else ("", "", "")
+        if len(ids) != 1 or not abertura or not resto.strip():
+            raise ValueError("A mensagem precisa de uma saudação curta, uma linha em branco e o resto do texto.")
+        with bot.db() as c:
+            if not c.execute("UPDATE leads SET envio_msg=? WHERE id=? AND envio='fila'", (texto.strip()[:4000], ids[0])).rowcount:
+                raise ValueError("Lead não está na fila.")
+        return
     if d.get("acao") != "adicionar":
         raise ValueError("Ação inválida.")
-    perfil = bot.carregar_config().get("perfil", {})
+    cfg = bot.carregar_config()
+    perfil = cfg.get("perfil", {})
     if not (perfil.get("nome") or "").strip():
         raise ValueError("Preencha seu nome em Nova prospecção → Seu perfil antes de montar a fila.")
     with bot.db() as c:
         c.row_factory = sqlite3.Row
         for i in ids:
             r = c.execute("SELECT * FROM leads WHERE id=?", (i,)).fetchone()
-            if not r or r["tel_tipo"] not in ("whatsapp", "celular") or r["envio"] == "enviado":
-                continue
-            # congela a mensagem como está agora (perfil e saudação do momento)
-            c.execute("UPDATE leads SET envio='fila', envio_msg=?, envio_erro=NULL WHERE id=?", (bot.mensagem(dict(r), perfil), i))
+            if not r or r["tel_tipo"] not in ("whatsapp", "celular") or r["envio"] in ("enviado", "fila") \
+                    or r["etapa"] in ("descartado", "perdido"):
+                continue  # descartado (inclui "Nunca contatar") não entra; quem já está na fila mantém o texto
+            # congela a mensagem como está agora (seus dados, perfil de venda e saudação do momento)
+            msg = bot.mensagem(dict(r), perfil, pv=bot.perfil_venda(r["perfil_venda"] or bot.PADRAO, cfg))
+            c.execute("UPDATE leads SET envio='fila', envio_msg=?, envio_erro=NULL WHERE id=?", (msg, i))
 
 
 def resultado_envio(d):
@@ -154,6 +199,8 @@ def estado_bot():
     feitos = [m for m in (re.search(r"Buscando (\d+)/(\d+): (.+)", l) for l in linhas) if m]
     novos = sum(int(m.group(1)) for m in (re.search(r"\+(\d+) leads", l) for l in linhas) if m)
     ultimo = feitos[-1] if feitos else None
+    marcos = [l for l in linhas if "Buscando" in l or "Revisando" in l or "Revisão do Claude" in l]
+    revisando = rodando and bool(marcos) and "Revisando" in marcos[-1]
     return {
         "rodando": rodando,
         "status": "rodando" if rodando else ("concluido" if p and p.returncode == 0 else "parado" if p else "ocioso"),
@@ -162,11 +209,12 @@ def estado_bot():
         "inicio": BOT["inicio"],
         "atual": int(ultimo.group(1)) if ultimo else 0,
         "total": int(ultimo.group(2)) if ultimo else len((BOT["params"] or {}).get("cidades", [])) * len((BOT["params"] or {}).get("nichos", [])),
-        "etapa": ultimo.group(3) if ultimo else "",
+        "etapa": "Claude revisando os leads novos com as instruções do perfil" if revisando else ultimo.group(3) if ultimo else "",
+        "revisando": revisando,
         "novos": novos,
         "avisos": sum("falhou" in l for l in linhas),
         "log": linhas[-40:],
-        "nichos": [{"id": k, "rotulo": v["rotulo"]} for k, v in bot.NICHOS.items()],
+        "nichos": [{"id": k, "rotulo": v["rotulo"], "extra": v.get("extra", False)} for k, v in bot.nichos().items()],
         "intervalo_horas": bot.INTERVALO_HORAS,
     }
 
@@ -175,7 +223,7 @@ def iniciar_bot(d):
     if BOT["proc"] and BOT["proc"].poll() is None:
         raise ValueError("A prospecção já está rodando.")
     cidades = [c.strip() for c in d.get("cidades", []) if isinstance(c, str) and c.strip()]
-    nichos = [n for n in d.get("nichos", []) if n in bot.NICHOS]
+    nichos = [n for n in d.get("nichos", []) if n in bot.nichos()]
     if not cidades or any(re.search(r'["\\,]', c) or len(c) > 60 for c in cidades):
         raise ValueError("Informe ao menos uma cidade válida.")
     if not nichos:
@@ -186,8 +234,9 @@ def iniciar_bot(d):
         if not key:
             raise ValueError("Salve a chave do Google Places antes de usar essa fonte.")
         env["GOOGLE_PLACES_KEY"] = key
-    cmd = [sys.executable, "-u", "-X", "utf8", os.path.join(RAIZ, "bot.py"),
-           "--cidades", ",".join(cidades), "--nichos", ",".join(nichos)] + (["--loop"] if d.get("loop") else [])
+    cmd = [sys.executable, "-u", "-X", "utf8", os.path.join(RAIZ, "bot.py"), "--cidades", ",".join(cidades),
+           "--nichos", ",".join(nichos), "--fonte", "google" if d.get("fonte") == "google" else "osm",
+           "--perfil", bot.perfil_venda()["id"], "--revisar"] + (["--loop"] if d.get("loop") else [])
     saida = open(LOG, "w", encoding="utf-8")
     BOT.update(proc=subprocess.Popen(cmd, stdout=saida, stderr=subprocess.STDOUT, env=env, cwd=RAIZ),
                params={"cidades": cidades, "nichos": nichos, "fonte": d.get("fonte", "osm"), "loop": bool(d.get("loop"))},
@@ -214,8 +263,259 @@ def salvar_config(d):
         cfg["perfil"] = {k: str(perfil.get(k, ""))[:200] for k in ("nome", "funcao", "portfolio")}
     if isinstance(d.get("google_key"), str):
         cfg["google_key"] = d["google_key"].strip()
-    with open(bot.CONFIG, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    bot.gravar_config(cfg)
+
+
+def salvar_lead(d):
+    if not isinstance(d.get("id"), str) or d.get("etapa", ETAPAS[0]) not in ETAPAS:
+        raise ValueError("dados inválidos")
+    if d.get("proximo_em") and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(d["proximo_em"])):
+        raise ValueError("Data inválida.")
+    agora = datetime.now().isoformat(timespec="seconds")
+    sets = [(f"{k}=?", (str(d[k] or "")[:4000] or None,))
+            for k in ("notas", "motivo", "prototipo", "valor", "proximo", "proximo_em") if k in d]
+    if "etapa" in d:  # etapa_em só muda quando a etapa muda (o UPDATE enxerga a etapa antiga)
+        sets += [("etapa_em=CASE WHEN etapa IS ? THEN etapa_em ELSE ? END", (d["etapa"], agora)), ("etapa=?", (d["etapa"],))]
+    if d.get("quadro") or d.get("etapa") in RESPONDEU:
+        sets.append(("respondeu_em=COALESCE(respondeu_em, ?)", (agora,)))
+    if "quadro" in d:  # entra no dashboard (guarda a data da 1ª vez) ou sai dele
+        sets.append(("quadro_em=COALESCE(quadro_em, ?)", (agora,)) if d["quadro"] else ("quadro_em=NULL", ()))
+    if not sets:
+        raise ValueError("dados inválidos")
+    with bot.db() as c:
+        return c.execute(f"UPDATE leads SET {', '.join(x for x, _ in sets)} WHERE id=?",
+                         (*[v for _, vs in sets for v in vs], d["id"])).rowcount
+
+
+def registrar_resposta(d):
+    """A rotina viu a resposta na lista de conversas do WhatsApp (só a prévia, sem abrir a conversa).
+    interesse -> Respondeu, no dashboard · recusa -> Perdido (Sem interesse) · automatica -> só anota."""
+    tipo, texto = d.get("tipo"), str(d.get("texto") or "").strip()[:500]
+    if tipo not in ("interesse", "recusa", "automatica") or not isinstance(d.get("id"), str):
+        raise ValueError("dados inválidos")
+    agora = datetime.now()
+    ts = agora.isoformat(timespec="seconds")
+    with bot.db() as c:
+        r = c.execute("SELECT etapa, motivo, notas FROM leads WHERE id=?", (d["id"],)).fetchone()
+        if not r:
+            raise ValueError("Lead não encontrado.")
+        etapa, motivo, notas = r
+        if texto and f"“{texto}”" in (notas or ""):  # as duas rotinas podem ver a mesma conversa não lida
+            return etapa
+        nota = f"{agora:%d/%m} {dict(interesse='respondeu', recusa='recusou', automatica='resposta automática')[tipo]}" + \
+               (f": “{texto}”" if texto else "")
+        c.execute("UPDATE leads SET notas=? WHERE id=?", ((notas + "\n" if notas else "") + nota, d["id"]))
+        aguardando = etapa in ("abordagem_pronta", "qualificado", "contatado") or (etapa == "perdido" and motivo == "Não respondeu")
+        if tipo == "interesse" and aguardando:
+            etapa = "respondeu"
+            c.execute("""UPDATE leads SET etapa='respondeu', motivo=NULL, etapa_em=?, quadro_em=COALESCE(quadro_em, ?),
+                         respondeu_em=COALESCE(respondeu_em, ?) WHERE id=?""", (ts, ts, ts, d["id"]))
+        elif tipo == "recusa" and aguardando:
+            etapa = "perdido"
+            c.execute("UPDATE leads SET etapa='perdido', motivo='Sem interesse', etapa_em=?, respondeu_em=COALESCE(respondeu_em, ?) "
+                      "WHERE id=?", (ts, ts, d["id"]))
+    return etapa
+
+
+def followups():
+    """Quem recebe o follow-up: contatado pela fila, sem resposta há `dias` e com o follow-up ligado no perfil dele."""
+    cfg = bot.carregar_config()
+    perfil, todos = cfg.get("perfil", {}), bot.perfis_venda(cfg)
+    with bot.db() as c:
+        c.row_factory = sqlite3.Row
+        rows = [dict(r) for r in c.execute(
+            "SELECT * FROM leads WHERE etapa='contatado' AND envio='enviado' AND followup_em IS NULL ORDER BY envio_em")]
+    itens = []
+    for r in rows:
+        f = (todos.get(r["perfil_venda"]) or todos[bot.PADRAO])["contato"]["followup"]
+        if f["ativo"] and fone_whats(r["telefone"]) and r["envio_em"] < (datetime.now() - timedelta(days=f["dias"])).isoformat():
+            itens.append({"id": r["id"], "nome": r["nome"], "cidade": r["cidade"], "whatsapp": fone_whats(r["telefone"]),
+                          "mensagem": bot.preencher(f["mensagem"], bot.variaveis(r, perfil))})
+    return {"itens": itens}
+
+
+def resultado_followup(d):
+    if d.get("status") not in ("enviado", "falhou") or not isinstance(d.get("id"), str):
+        raise ValueError("dados inválidos")
+    agora = datetime.now()
+    nota = f"{agora:%d/%m} follow-up não enviado: {str(d.get('erro') or 'erro')[:200]}" if d["status"] == "falhou" else None
+    with bot.db() as c:  # falha também conta como feito, para não tentar todo dia
+        n = c.execute("UPDATE leads SET followup_em=?, notas=CASE WHEN ? IS NULL THEN notas ELSE COALESCE(notas || char(10), '') || ? END "
+                      "WHERE id=? AND etapa='contatado' AND followup_em IS NULL",
+                      (agora.isoformat(timespec="seconds"), nota, nota, d["id"])).rowcount
+    if not n:
+        raise ValueError("Lead não está esperando follow-up.")
+
+
+def mexer_nichos(d):
+    with TRAVA:
+        cfg = bot.carregar_config()
+        extras = [x for x in cfg.get("nichos_extras", []) if x.get("id")]
+        if d.get("acao") == "criar":
+            n = d.get("nicho") if isinstance(d.get("nicho"), dict) else {}
+            rotulo = str(n.get("rotulo") or "").strip()[:40]
+            busca = re.sub(r"[^\w\s-]", "", str(n.get("busca") or rotulo)).strip()[:40]
+            segmento = str(n.get("segmento") or "").strip()[:60]
+            if len(rotulo) < 2 or len(busca) < 3:
+                raise ValueError("Informe o nome do nicho e o termo de busca.")
+            if not segmento:
+                raise ValueError("Diga como chamar esses negócios no plural (ex.: imobiliárias).")
+            id_ = "x_" + re.sub(r"[^a-z0-9]+", "_", bot.sem_acento(rotulo)).strip("_")
+            if id_ in bot.nichos():
+                raise ValueError("Já existe um nicho com esse nome.")
+            extras.append({"id": id_, "rotulo": rotulo, "busca": busca, "segmento": segmento,
+                           "ticket": n.get("ticket") if n.get("ticket") in (5, 10, 15) else 10})
+        elif d.get("acao") == "excluir":
+            extras = [x for x in extras if x["id"] != d.get("id")]
+            for p in cfg.get("perfis_venda", []):
+                p["prospeccao"]["nichos"] = [x for x in p["prospeccao"]["nichos"] if x != d.get("id")]
+        else:
+            raise ValueError("Ação inválida.")
+        cfg["nichos_extras"] = extras
+        bot.gravar_config(cfg)
+    return estado_bot()
+
+
+def backup(manter=14):
+    """Uma cópia do banco por dia em backups/, guardando as últimas `manter`. A API de backup do SQLite é segura
+    mesmo com o bot gravando."""
+    if not os.path.exists(bot.DB):
+        return
+    os.makedirs(BACKUPS, exist_ok=True)
+    destino = os.path.join(BACKUPS, f"leads-{datetime.now():%Y-%m-%d}.db")
+    if not os.path.exists(destino):
+        origem, copia = sqlite3.connect(bot.DB), sqlite3.connect(destino)
+        try:
+            origem.backup(copia)
+        finally:
+            origem.close()
+            copia.close()
+    for velho in sorted(f for f in os.listdir(BACKUPS) if f.startswith("leads-"))[:-manter]:
+        os.remove(os.path.join(BACKUPS, velho))
+
+
+def backups_diarios():
+    while True:
+        try:
+            backup()
+        except Exception as e:
+            print(f"backup falhou: {e}", flush=True)
+        time.sleep(3600)
+
+
+# ---------- perfis de venda ----------
+def inteiro(v, lo, hi, nome):
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        raise ValueError(f"{nome}: use um número inteiro.")
+    if not lo <= n <= hi:
+        raise ValueError(f"{nome}: use um valor entre {lo} e {hi}.")
+    return n
+
+
+def validar_perfil(p):
+    """Perfil vindo da tela -> perfil limpo, ou ValueError com a mensagem para mostrar."""
+    if not isinstance(p, dict) or not re.fullmatch(r"[a-z0-9_-]{1,40}", str(p.get("id") or "")):
+        raise ValueError("Perfil inválido.")
+    p = bot.completar(p)
+    pr, q, ct = p["prospeccao"], p["qualificacao"], p["contato"]
+    texto = lambda v, n=4000: str(v or "")[:n]
+    nome = texto(p["nome"], 60).strip()
+    if not nome:
+        raise ValueError("Dê um nome ao perfil.")
+    nichos = [n for n in pr["nichos"] if n in bot.nichos()] if isinstance(pr["nichos"], list) else []
+    if not nichos:
+        raise ValueError("Escolha ao menos um nicho.")
+    cidades = []
+    for cid in pr["cidades"] if isinstance(pr["cidades"], list) else []:
+        cid = cid if isinstance(cid, dict) else {"nome": cid}
+        nm = texto(cid.get("nome"), 60).strip()
+        if nm and not re.search(r'["\\,]', nm) and all(bot.sem_acento(nm) != bot.sem_acento(x["nome"]) for x in cidades):
+            cidades.append({"nome": nm, "feita": texto(cid.get("feita"), 10)})
+    pontos = {k: inteiro(q["pontos"].get(k), -100, 100, f"Pontos de “{rot}”") for k, rot in bot.SINAIS.items()}
+    faixas = {k: inteiro(q[k], 0, 100, rot) for k, rot in
+              (("quente", "Quente a partir de"), ("morno", "Morno a partir de"), ("minimo", "Descartar abaixo de"))}
+    if not faixas["minimo"] <= faixas["morno"] <= faixas["quente"]:
+        raise ValueError("As faixas precisam crescer: descartar ≤ morno ≤ quente.")
+    msg = texto(ct["mensagem"]).strip()
+    abertura, _, resto = msg.partition("\n\n")
+    if "{saudacao}" not in abertura or not resto.strip():
+        raise ValueError("Comece a mensagem com um parágrafo curto que tenha {saudacao} e deixe uma linha em branco: "
+                         "ele é enviado sozinho, antes do resto.")
+    fu = ct["followup"]
+    followup = {"ativo": fu["ativo"] is True, "dias": inteiro(fu["dias"], 1, 30, "Dias até o follow-up"),
+                "mensagem": texto(fu["mensagem"], 2000).strip()}
+    if followup["ativo"] and not followup["mensagem"]:
+        raise ValueError("Escreva a mensagem de follow-up antes de ligar.")
+    propostas = [{"titulo": texto(x.get("titulo"), 40).strip(), "texto": texto(x.get("texto"), 2000).strip()}
+                 for x in (ct["propostas"] if isinstance(ct["propostas"], list) else [])[:8]
+                 if isinstance(x, dict) and (str(x.get("titulo") or "").strip() or str(x.get("texto") or "").strip())]
+    return {"id": p["id"], "nome": nome,
+            "prospeccao": {"cidades": cidades, "nichos": nichos, "fonte": "google" if pr["fonte"] == "google" else "osm",
+                           "instrucoes": texto(pr["instrucoes"])},
+            "qualificacao": {"pontos": pontos, **faixas, "instrucoes": texto(q["instrucoes"])},
+            "contato": {"mensagem": msg, "limite_dia": inteiro(ct["limite_dia"], 1, 60, "Limite por dia"),
+                        "espera_s": inteiro(ct["espera_s"], 5, 120, "Espera entre as duas mensagens"),
+                        "dias_sem_resposta": inteiro(ct["dias_sem_resposta"], 1, 60, "Dias sem resposta"),
+                        "followup": followup, "propostas": propostas,
+                        "instrucoes": texto(ct["instrucoes"])}}
+
+
+def perfis():
+    cfg = bot.carregar_config()
+    todos = bot.perfis_venda(cfg)
+    prontos = []
+    if os.path.exists(bot.DB):
+        with bot.db() as c:
+            c.row_factory = sqlite3.Row
+            prontos = [dict(r) for r in c.execute("SELECT * FROM leads WHERE etapa='abordagem_pronta' ORDER BY score DESC LIMIT 200")]
+
+    def amostra(p):  # um lead pronto de um nicho do perfil; sem nenhum, um exemplo com o 1º nicho e a 1ª cidade dele
+        pr = p["prospeccao"]
+        return next((r for r in prontos if r["nicho"] in pr["nichos"]), None) or {
+            "nome": "Empresa Exemplo", "nicho": pr["nichos"][0], "diagnostico": "sem site",
+            "cidade": pr["cidades"][0]["nome"] if pr["cidades"] else "sua cidade"}
+
+    exemplos = {k: amostra(p) for k, p in todos.items()}
+    return {"perfis": list(todos.values()), "ativo": bot.perfil_venda(None, cfg)["id"], "padrao": bot.PADRAO,
+            "sinais": bot.SINAIS, "variaveis": bot.VARIAVEIS, "amostra": {k: a["nome"] for k, a in exemplos.items()},
+            "previa": {k: bot.mensagem(exemplos[k], cfg.get("perfil", {}), pv=p) for k, p in todos.items()}}
+
+
+TRAVA = threading.Lock()  # autosave da tela pode chegar enquanto o anterior ainda requalifica
+
+
+def mexer_perfis(d):
+    with TRAVA:
+        cfg = bot.carregar_config()
+        salvos, todos = [p for p in cfg.get("perfis_venda", []) if p.get("id")], bot.perfis_venda(cfg)
+        ativo, acao, repontuar = bot.perfil_venda(None, cfg)["id"], d.get("acao"), None
+        if acao == "salvar":
+            p = validar_perfil(d.get("perfil"))
+            cfg["perfis_venda"] = [p if x["id"] == p["id"] else x for x in salvos] + \
+                                  ([] if any(x["id"] == p["id"] for x in salvos) else [p])
+            if p["id"] == ativo and p["qualificacao"] != todos[ativo]["qualificacao"]:
+                repontuar = p
+        elif acao == "ativar":
+            if d.get("id") not in todos:
+                raise ValueError("Perfil não encontrado.")
+            cfg["perfil_ativo"] = d["id"]
+            repontuar = todos[d["id"]]
+        elif acao == "excluir":
+            if d.get("id") == bot.PADRAO:
+                raise ValueError("O perfil padrão não pode ser excluído.")
+            if d.get("id") == ativo:
+                raise ValueError("Ative outro perfil antes de excluir este.")
+            cfg["perfis_venda"] = [x for x in salvos if x["id"] != d.get("id")]
+        else:
+            raise ValueError("Ação inválida.")
+        bot.gravar_config(cfg)
+        n = None
+        if repontuar:
+            with bot.db() as c:
+                n = bot.repontuar(c, repontuar)
+    return {**perfis(), "requalificados": n}
 
 
 # ---------- HTTP ----------
@@ -242,6 +542,10 @@ class H(BaseHTTPRequestHandler):
             return self.responder(estado_bot())
         if self.path == "/api/fila":
             return self.responder(fila())
+        if self.path == "/api/perfis":
+            return self.responder(perfis())
+        if self.path == "/api/followups":
+            return self.responder(followups())
         if self.path == "/api/config":
             cfg = bot.carregar_config()
             return self.responder({"perfil": cfg.get("perfil", {}), "tem_google_key": bool(cfg.get("google_key"))})
@@ -261,12 +565,17 @@ class H(BaseHTTPRequestHandler):
             return self.erro("JSON inválido")
         try:
             if self.path == "/api/lead":
-                if d.get("etapa") not in ETAPAS or not isinstance(d.get("id"), str):
-                    return self.erro("dados inválidos")
-                with bot.db() as c:
-                    n = c.execute("UPDATE leads SET etapa=?, notas=?, motivo=? WHERE id=?",
-                                  (d["etapa"], str(d.get("notas") or ""), str(d.get("motivo") or "") or None, d["id"])).rowcount
+                n = salvar_lead(d)
                 return self.responder({"ok": bool(n)}, status=200 if n else 404)
+            if self.path == "/api/perfis":
+                return self.responder(mexer_perfis(d))
+            if self.path == "/api/nichos":
+                return self.responder(mexer_nichos(d))
+            if self.path == "/api/resposta":
+                return self.responder({"etapa": registrar_resposta(d)})
+            if self.path == "/api/followups":
+                resultado_followup(d)
+                return self.responder({"ok": True})
             if self.path == "/api/bot/iniciar":
                 iniciar_bot(d)
                 return self.responder(estado_bot())
@@ -303,6 +612,64 @@ def demo():
         except ValueError:
             pass
     assert fone_whats("(19) 3342-5050") == "551933425050" and fone_whats("123") == "" and fone_whats(None) == ""
+    assert "Nunca contatar" in MOTIVOS
+    ok = validar_perfil({"id": "sis", "nome": " Sistemas ", "prospeccao": {"cidades": ["Cambé", {"nome": "cambe"}, "a,b"]}})
+    assert ok["nome"] == "Sistemas" and ok["prospeccao"]["cidades"] == [{"nome": "Cambé", "feita": ""}], ok
+    for ruim in ({"id": "A B"}, {"id": "x", "nome": ""}, {"id": "x", "prospeccao": {"nichos": ["xyz"]}},
+                 {"id": "x", "qualificacao": {"quente": 30}}, {"id": "x", "qualificacao": {"pontos": {"fixo": "a"}}},
+                 {"id": "x", "contato": {"mensagem": "Olá {empresa}\n\nresto"}}, {"id": "x", "contato": {"mensagem": "{saudacao}!"}}):
+        try:
+            validar_perfil(ruim)
+            raise AssertionError(ruim)
+        except ValueError:
+            pass
+    import tempfile
+    bot.DB = os.path.join(tempfile.mkdtemp(), "t.db")
+    with bot.db() as c:
+        velho, novo = [(datetime.now() - timedelta(days=d)).isoformat() for d in (8, 2)]
+        c.executemany("INSERT INTO leads(id, etapa, envio, envio_em, envio_erro) VALUES(?,?,?,?,?)", [
+            ("a", "contatado", "enviado", velho, None), ("b", "contatado", "enviado", novo, None),
+            ("c", "abordagem_pronta", "falhou", novo, "Número não está no WhatsApp"),
+            ("d", "abordagem_pronta", "falhou", novo, "timeout"), ("e", "respondeu", "enviado", velho, None)])
+        sem_fu = {"dias_sem_resposta": 7, "followup": {"ativo": False}}
+        limpar_funil(c, sem_fu)
+        assert dict(c.execute("SELECT id, etapa FROM leads").fetchall()) == {
+            "a": "perdido", "b": "contatado", "c": "descartado", "d": "abordagem_pronta", "e": "respondeu"}
+        c.execute("INSERT INTO leads(id, etapa, envio, envio_em) VALUES('f', 'contatado', 'enviado', ?)", (velho,))
+        c.commit()
+        limpar_funil(c, {"dias_sem_resposta": 7, "followup": {"ativo": True}})  # follow-up ainda não saiu: espera
+        assert c.execute("SELECT etapa FROM leads WHERE id='f'").fetchone()[0] == "contatado"
+    assert salvar_lead({"id": "b", "etapa": "prototipo", "proximo": "Ligar", "proximo_em": "2026-11-02"}) == 1
+    with bot.db() as c:
+        assert c.execute("SELECT etapa, proximo_em, respondeu_em IS NOT NULL, etapa_em IS NOT NULL FROM leads WHERE id='b'"
+                         ).fetchone() == ("prototipo", "2026-11-02", 1, 1)
+    for ruim in ({"id": "b", "proximo_em": "02/11"}, {"id": "b", "etapa": "xyz"}):
+        try:
+            salvar_lead(ruim)
+            raise AssertionError(ruim)
+        except ValueError:
+            pass
+    assert registrar_resposta({"id": "f", "tipo": "automatica", "texto": "Olá! Digite 1 para horários"}) == "contatado"
+    assert registrar_resposta({"id": "f", "tipo": "interesse", "texto": "Quanto custa?"}) == "respondeu"
+    assert registrar_resposta({"id": "f", "tipo": "interesse", "texto": "Quanto custa?"}) == "respondeu"  # repetida
+    assert registrar_resposta({"id": "a", "tipo": "recusa", "texto": "Não tenho interesse"}) == "perdido"
+    with bot.db() as c:
+        notas, quadro = c.execute("SELECT notas, quadro_em IS NOT NULL FROM leads WHERE id='f'").fetchone()
+        assert quadro and notas.count("Quanto custa?") == 1 and "resposta automática" in notas, notas
+        assert c.execute("SELECT motivo FROM leads WHERE id='a'").fetchone()[0] == "Sem interesse"
+    bot.carregar_config = lambda: {"perfis_venda": [bot.completar({"id": "landing", "contato": {"followup": {"ativo": True}}})]}
+    with bot.db() as c:
+        c.execute("INSERT INTO leads(id, nome, nicho, telefone, etapa, envio, envio_em) VALUES"
+                  "('g', 'Clínica Sol', 'dentista', '43 99999-0000', 'contatado', 'enviado', ?)", (velho,))
+        c.commit()
+    fu = followups()["itens"]
+    assert [x["id"] for x in fu] == ["g"] and "Clínica Sol" in fu[0]["mensagem"] and fu[0]["whatsapp"] == "5543999990000", fu
+    resultado_followup({"id": "g", "status": "enviado"})
+    assert followups()["itens"] == []
+    global BACKUPS
+    BACKUPS = os.path.join(os.path.dirname(bot.DB), "bk")
+    backup(manter=1)
+    assert len(os.listdir(BACKUPS)) == 1
     print("ok")
 
 
@@ -314,6 +681,7 @@ if __name__ == "__main__":
     except OSError:
         sys.exit(f"Porta {PORTA} ocupada: o painel já deve estar aberto em http://localhost:{PORTA}")
     print(f"Painel em http://localhost:{PORTA}  (Ctrl+C para parar)", flush=True)
+    threading.Thread(target=backups_diarios, daemon=True).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

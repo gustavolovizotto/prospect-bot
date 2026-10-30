@@ -5,3 +5,5 @@ __pycache__/
 .claude/
 config.json
 requalificacao.log
+backups/
+painel.log
