@@ -3,7 +3,7 @@
 
 Servidor só-stdlib. Front em static/ (index.html, app.css, app.js).
 API:
-  GET  /api/leads          -> {"leads", "etapas", "motivos"}
+  GET  /api/leads          -> {"leads", "etapas", "motivos"}  (leads do dashboard trazem "reengajar")
   POST /api/lead           <- {"id", "etapa"?, "notas"?, "motivo"?, "prototipo"?, "valor"?, "quadro"?: bool}  (só o que vier)
   GET  /api/bot            -> estado da prospecção (rodando, progresso, log) + nichos
   POST /api/bot/iniciar    <- {"cidades": [...], "nichos": [...], "fonte": "osm"|"google", "loop": bool}
@@ -19,9 +19,14 @@ API:
   POST /api/resposta       <- {"id", "tipo": "interesse"|"recusa"|"automatica", "texto"}  (rotina viu a resposta no WhatsApp)
   GET  /api/followups      -> quem recebe o follow-up hoje, com a mensagem pronta
   POST /api/followups      <- {"id", "status": "enviado"|"falhou", "erro"?}
+  POST /api/conversas      <- {"itens": [{"id", "quando": "14:32"|"Ontem"|"terça-feira"|"28/10/2026", "de": "eu"|"lead",
+                               "lida"?: bool, "previa"?}]}  (o Claude leu a lista do WhatsApp Web)
+  GET  /api/reengajar      -> leads do dashboard em andamento: última mensagem, fila de reengajamento e sugestão
+  POST /api/reengajar      <- {"ids": [...], "acao": "adicionar"|"remover"|"editar", "mensagem"? (1 id)}
+  POST /api/reengajar/resultado <- {"id", "status": "enviado"|"falhou", "erro"?}
 """
 import atexit, json, mimetypes, os, re, sqlite3, subprocess, sys, threading, time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import bot
@@ -34,6 +39,7 @@ PORTA = int(os.environ.get("PORTA", 8765))
 ETAPAS = ["abordagem_pronta", "qualificado", "contatado", "respondeu", "prototipo", "proposta", "negociando", "fechado",
           "perdido", "descartado"]
 RESPONDEU = ("respondeu", "prototipo", "proposta", "negociando", "fechado")  # etapas de quem já respondeu
+ANDAMENTO = RESPONDEU[:-1]  # no dashboard e ainda sem desfecho
 MOTIVOS = ["Já tem site e está satisfeito", "Sem interesse", "Sem orçamento agora", "Contato inválido",
            "Fechou com outro", "Não respondeu", "Nunca contatar"]  # "Nunca contatar": contato pessoal, pedido para sair...
 
@@ -86,11 +92,136 @@ def limpar_funil(c, ct):
               (agora.isoformat(timespec="seconds"), (agora - timedelta(days=ct["dias_sem_resposta"])).isoformat(timespec="seconds")))
 
 
+# ---------- reengajamento (leads do dashboard) ----------
+# O Claude lê a lista de conversas do WhatsApp Web (sem abrir nenhuma) e registra a última mensagem de cada lead do
+# dashboard. Quem está parado há `dias` entra na fila de reengajamento com uma mensagem sugerida (rotinas/reengajar.md).
+SEMANA = ["segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado", "domingo"]
+
+
+def quando_whats(rotulo, agora):
+    """Horário da lista do WhatsApp ("14:32", "Ontem", "terça-feira", "28/10/2026") -> "AAAA-MM-DD[THH:MM]" ou None."""
+    t, hoje = str(rotulo or "").strip().lower(), agora.date()
+    if re.fullmatch(r"\d{1,2}:\d{2}", t):
+        return f"{hoje}T{t.zfill(5)}"
+    if t == "ontem":
+        return str(hoje - timedelta(days=1))
+    if t in SEMANA:  # na última semana a lista mostra o dia da semana
+        return str(hoje - timedelta(days=(hoje.weekday() - SEMANA.index(t)) % 7 or 7))
+    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{4})", t)
+    try:
+        return str(date(int(m[3]), int(m[2]), int(m[1]))) if m else None
+    except ValueError:
+        return None
+
+
+def situacao(r, rg, perfil, agora):
+    """Lead do dashboard -> {"parado": dias desde a última mensagem (None sem conferir), "pronto": pode entrar na
+    fila, "sugestao": modelo da próxima mensagem do perfil (só quando a última mensagem é sua)}.
+    Fica de fora quem tem o próximo passo marcado para depois de hoje (já está combinado) e quem já recebeu as
+    3 tentativas sem responder (hora de mover para Perdido)."""
+    parado = (agora.date() - date.fromisoformat(r["conversa_em"][:10])).days if r["conversa_em"] else None
+    n, msgs = r["reengajamentos"] or 0, rg["mensagens"]
+    modelos = [m for m in msgs if m.strip()]
+    sugestao = bot.preencher(modelos[n], bot.variaveis(r, perfil)) if r["conversa_de"] == "eu" and n < len(modelos) else None
+    pronto = (parado is not None and parado >= rg["dias"] and r["etapa"] in ANDAMENTO and r["reeng"] != "fila"
+              and n < len(msgs) and bool(fone_whats(r["telefone"])) and (r["proximo_em"] or "") <= str(agora.date()))
+    return {"parado": parado, "pronto": pronto, "sugestao": sugestao, "esgotado": n >= len(msgs)}
+
+
+def reengajar_lista():
+    cfg = bot.carregar_config()
+    perfil, todos, agora = cfg.get("perfil", {}), bot.perfis_venda(cfg), datetime.now()
+    with bot.db() as c:
+        c.row_factory = sqlite3.Row
+        rows = [dict(r) for r in c.execute(f"SELECT * FROM leads WHERE quadro_em IS NOT NULL AND etapa IN "
+                                           f"({','.join('?' * len(ANDAMENTO))}) ORDER BY conversa_em", ANDAMENTO)]
+    campos = ("id", "nome", "nicho", "cidade", "etapa", "notas", "prototipo", "valor", "proximo", "proximo_em",
+              "conversa_em", "conversa_de", "conversa_lida", "conversa_previa", "conversa_conferida_em",
+              "reeng", "reeng_msg", "reeng_em", "reengajamentos")
+    itens = []
+    for r in rows:
+        rg = (todos.get(r["perfil_venda"]) or todos[bot.PADRAO])["contato"]["reengajamento"]
+        itens.append({**{k: r[k] for k in campos}, "whatsapp": fone_whats(r["telefone"]), "dias": rg["dias"],
+                      **situacao(r, rg, perfil, agora)})
+    return {"itens": itens}
+
+
+def registrar_conversas(d):
+    itens = d.get("itens")
+    if not isinstance(itens, list) or not itens:
+        raise ValueError("Envie os itens lidos no WhatsApp.")
+    agora = datetime.now()
+    with bot.db() as c:
+        for it in itens:
+            it = it if isinstance(it, dict) else {}
+            em = quando_whats(it.get("quando"), agora)
+            if not em or it.get("de") not in ("eu", "lead") or not isinstance(it.get("id"), str):
+                raise ValueError(f"Item inválido: {it}")
+            r = c.execute("SELECT reeng_em FROM leads WHERE id=?", (it["id"],)).fetchone()
+            if not r:
+                raise ValueError(f"Lead não encontrado: {it['id']}")
+            dele = it["de"] == "lead" and em > (r[0] or "")  # ele falou depois do último reengajamento: recomeça
+            c.execute("""UPDATE leads SET conversa_em=?, conversa_de=?, conversa_lida=?, conversa_previa=?,
+                         conversa_conferida_em=?, reengajamentos=CASE WHEN ? THEN 0 ELSE reengajamentos END,
+                         reeng_msg=CASE WHEN ? AND reeng='fila' THEN NULL ELSE reeng_msg END,
+                         reeng=CASE WHEN ? AND reeng='fila' THEN NULL ELSE reeng END WHERE id=?""",
+                      (em, it["de"], "1" if it["de"] == "eu" and it.get("lida") else None,
+                       str(it.get("previa") or "")[:300] or None, agora.isoformat(timespec="seconds"), dele, dele, dele, it["id"]))
+    return reengajar_lista()
+
+
+def mexer_reengajar(d):
+    ids, acao = d.get("ids"), d.get("acao")
+    if not isinstance(ids, list) or not ids or not all(isinstance(i, str) for i in ids):
+        raise ValueError("Selecione ao menos um lead.")
+    texto = str(d.get("mensagem") or "").strip()[:4000]
+    with bot.db() as c:
+        if acao == "remover":
+            c.executemany("UPDATE leads SET reeng=NULL, reeng_msg=NULL WHERE id=? AND reeng='fila'", [(i,) for i in ids])
+        elif acao == "editar":
+            if len(ids) != 1 or not texto:
+                raise ValueError("Escreva a mensagem.")
+            if not c.execute("UPDATE leads SET reeng_msg=? WHERE id=? AND reeng='fila'", (texto, ids[0])).rowcount:
+                raise ValueError("Lead não está na fila de reengajamento.")
+        elif acao == "adicionar":
+            if texto and len(ids) != 1:
+                raise ValueError("Mensagem escrita vale para um lead por vez.")
+            prontos = {x["id"]: x for x in reengajar_lista()["itens"] if x["pronto"]}
+            agora = datetime.now().isoformat(timespec="seconds")
+            for i in ids:  # só quem está parado há `dias`, com WhatsApp, fora da fila e com tentativas sobrando
+                msg = i in prontos and (texto or prontos[i]["sugestao"])
+                if msg:
+                    c.execute("UPDATE leads SET reeng='fila', reeng_msg=?, reeng_em=? WHERE id=?", (msg, agora, i))
+        else:
+            raise ValueError("Ação inválida.")
+    return reengajar_lista()
+
+
+def resultado_reengajar(d):
+    status = d.get("status")
+    if status not in ("enviado", "falhou") or not isinstance(d.get("id"), str):
+        raise ValueError("dados inválidos")
+    agora = datetime.now()
+    ts = agora.isoformat(timespec="seconds")
+    with bot.db() as c:
+        r = c.execute("SELECT reeng_msg, notas FROM leads WHERE id=? AND reeng='fila'", (d["id"],)).fetchone()
+        if not r:
+            raise ValueError("Lead não está na fila de reengajamento.")
+        nota = f"{agora:%d/%m} reengajamento " + ("enviado" if status == "enviado" else f"não enviado: {str(d.get('erro') or 'erro')[:200]}")
+        notas = (r[1] + "\n" if r[1] else "") + nota
+        if status == "enviado":  # agora a última mensagem é sua
+            c.execute("""UPDATE leads SET reeng='enviado', reeng_em=?, reengajamentos=COALESCE(reengajamentos, 0) + 1,
+                         conversa_em=?, conversa_de='eu', conversa_lida=NULL, conversa_previa=?, notas=? WHERE id=?""",
+                      (ts, ts[:16], r[0][:300], notas, d["id"]))
+        else:
+            c.execute("UPDATE leads SET reeng='falhou', reeng_em=?, notas=? WHERE id=?", (ts, notas, d["id"]))
+
+
 def leads():
     if not os.path.exists(bot.DB):
         return []
     cfg = bot.carregar_config()
-    perfil, todos = cfg.get("perfil", {}), bot.perfis_venda(cfg)
+    perfil, todos, agora = cfg.get("perfil", {}), bot.perfis_venda(cfg), datetime.now()
     with bot.db() as c:
         limpar_funil(c, bot.perfil_venda(None, cfg)["contato"])
         c.row_factory = sqlite3.Row
@@ -106,6 +237,7 @@ def leads():
         if r["quadro_em"]:  # {prototipo} e {preco} ficam para a tela trocar pelo que você digitar
             v = {**bot.variaveis(r, perfil), "prototipo": "{prototipo}", "preco": "{preco}"}
             r["propostas"] = [{"titulo": x["titulo"], "texto": bot.preencher(x["texto"], v)} for x in pv["contato"]["propostas"]]
+            r["reengajar"] = situacao(r, pv["contato"]["reengajamento"], perfil, agora)
         r["mensagem"] = bot.mensagem(r, perfil, pv=pv)  # sempre com seus dados atuais
         r["temperatura"] = bot.temperatura(r["score"] or 0, pv)
         r["analise"] = json.loads(r["analise"]) if r["analise"] else []
@@ -305,6 +437,10 @@ def registrar_resposta(d):
         nota = f"{agora:%d/%m} {dict(interesse='respondeu', recusa='recusou', automatica='resposta automática')[tipo]}" + \
                (f": “{texto}”" if texto else "")
         c.execute("UPDATE leads SET notas=? WHERE id=?", ((notas + "\n" if notas else "") + nota, d["id"]))
+        if tipo != "automatica":  # voltou a falar: a última mensagem é dele, a sequência recomeça e sai da fila
+            c.execute("""UPDATE leads SET conversa_em=?, conversa_de='lead', conversa_lida=NULL, conversa_previa=?,
+                         reengajamentos=0, reeng_msg=CASE WHEN reeng='fila' THEN NULL ELSE reeng_msg END,
+                         reeng=CASE WHEN reeng='fila' THEN NULL ELSE reeng END WHERE id=?""", (ts[:16], texto or None, d["id"]))
         aguardando = etapa in ("abordagem_pronta", "qualificado", "contatado") or (etapa == "perdido" and motivo == "Não respondeu")
         if tipo == "interesse" and aguardando:
             etapa = "respondeu"
@@ -448,6 +584,9 @@ def validar_perfil(p):
                 "mensagem": texto(fu["mensagem"], 2000).strip()}
     if followup["ativo"] and not followup["mensagem"]:
         raise ValueError("Escreva a mensagem de follow-up antes de ligar.")
+    rg = ct["reengajamento"]
+    reengajamento = {"dias": inteiro(rg["dias"], 1, 30, "Dias até reengajar"),  # sempre 3 caixas; vazia é pulada
+                     "mensagens": [texto(m, 2000).strip() for m in ((rg["mensagens"] if isinstance(rg["mensagens"], list) else []) + [""] * 3)[:3]]}
     propostas = [{"titulo": texto(x.get("titulo"), 40).strip(), "texto": texto(x.get("texto"), 2000).strip()}
                  for x in (ct["propostas"] if isinstance(ct["propostas"], list) else [])[:8]
                  if isinstance(x, dict) and (str(x.get("titulo") or "").strip() or str(x.get("texto") or "").strip())]
@@ -458,7 +597,7 @@ def validar_perfil(p):
             "contato": {"mensagem": msg, "limite_dia": inteiro(ct["limite_dia"], 1, 60, "Limite por dia"),
                         "espera_s": inteiro(ct["espera_s"], 5, 120, "Espera entre as duas mensagens"),
                         "dias_sem_resposta": inteiro(ct["dias_sem_resposta"], 1, 60, "Dias sem resposta"),
-                        "followup": followup, "propostas": propostas,
+                        "followup": followup, "reengajamento": reengajamento, "propostas": propostas,
                         "instrucoes": texto(ct["instrucoes"])}}
 
 
@@ -546,6 +685,8 @@ class H(BaseHTTPRequestHandler):
             return self.responder(perfis())
         if self.path == "/api/followups":
             return self.responder(followups())
+        if self.path == "/api/reengajar":
+            return self.responder(reengajar_lista())
         if self.path == "/api/config":
             cfg = bot.carregar_config()
             return self.responder({"perfil": cfg.get("perfil", {}), "tem_google_key": bool(cfg.get("google_key"))})
@@ -591,6 +732,13 @@ class H(BaseHTTPRequestHandler):
             if self.path == "/api/fila/resultado":
                 resultado_envio(d)
                 return self.responder({"ok": True})
+            if self.path == "/api/conversas":
+                return self.responder(registrar_conversas(d))
+            if self.path == "/api/reengajar":
+                return self.responder(mexer_reengajar(d))
+            if self.path == "/api/reengajar/resultado":
+                resultado_reengajar(d)
+                return self.responder({"ok": True})
         except ValueError as e:
             return self.erro(str(e))
         self.erro("não encontrado", 404)
@@ -615,9 +763,13 @@ def demo():
     assert "Nunca contatar" in MOTIVOS
     ok = validar_perfil({"id": "sis", "nome": " Sistemas ", "prospeccao": {"cidades": ["Cambé", {"nome": "cambe"}, "a,b"]}})
     assert ok["nome"] == "Sistemas" and ok["prospeccao"]["cidades"] == [{"nome": "Cambé", "feita": ""}], ok
+    assert ok["contato"]["reengajamento"]["dias"] == 3 and len(ok["contato"]["reengajamento"]["mensagens"]) == 3
+    assert validar_perfil({"id": "x", "contato": {"reengajamento": {"mensagens": ["só uma"]}}}
+                          )["contato"]["reengajamento"]["mensagens"] == ["só uma", "", ""]
     for ruim in ({"id": "A B"}, {"id": "x", "nome": ""}, {"id": "x", "prospeccao": {"nichos": ["xyz"]}},
                  {"id": "x", "qualificacao": {"quente": 30}}, {"id": "x", "qualificacao": {"pontos": {"fixo": "a"}}},
-                 {"id": "x", "contato": {"mensagem": "Olá {empresa}\n\nresto"}}, {"id": "x", "contato": {"mensagem": "{saudacao}!"}}):
+                 {"id": "x", "contato": {"mensagem": "Olá {empresa}\n\nresto"}}, {"id": "x", "contato": {"mensagem": "{saudacao}!"}},
+                 {"id": "x", "contato": {"reengajamento": {"dias": 0}}}):
         try:
             validar_perfil(ruim)
             raise AssertionError(ruim)
@@ -666,6 +818,57 @@ def demo():
     assert [x["id"] for x in fu] == ["g"] and "Clínica Sol" in fu[0]["mensagem"] and fu[0]["whatsapp"] == "5543999990000", fu
     resultado_followup({"id": "g", "status": "enviado"})
     assert followups()["itens"] == []
+    # reengajamento: o Claude registra a última mensagem vista no WhatsApp; parado há `dias` entra na fila
+    sex = datetime(2026, 10, 30, 15, 0)
+    assert quando_whats("9:05", sex) == "2026-10-30T09:05" and quando_whats("Ontem", sex) == "2026-10-29"
+    assert quando_whats("terça-feira", sex) == "2026-10-27" and quando_whats("sexta-feira", sex) == "2026-10-23"
+    assert quando_whats("28/09/2026", sex) == "2026-09-28" and quando_whats("31/02/2026", sex) is None
+    assert quando_whats("amanhã", sex) is None
+    rg = {"dias": 3, "mensagens": ["Oi, {empresa}", "", "Última"]}
+    bot.carregar_config = lambda: {"perfis_venda": [bot.completar({"id": "landing", "contato": {"reengajamento": rg}})]}
+    with bot.db() as c:
+        c.execute("INSERT INTO leads(id, nome, nicho, telefone, etapa, quadro_em) VALUES"
+                  "('h', 'Pet Feliz', 'pet', '43 98888-0000', 'proposta', ?)", (velho,))
+        c.commit()
+    h = lambda: next(x for x in reengajar_lista()["itens"] if x["id"] == "h")
+    atras = lambda n: (datetime.now() - timedelta(days=n)).strftime("%d/%m/%Y")
+    assert h()["parado"] is None and not h()["pronto"]  # ainda não conferido no WhatsApp
+    registrar_conversas({"itens": [{"id": "h", "quando": atras(4), "de": "eu", "lida": True, "previa": "Proposta"}]})
+    x = h()
+    assert x["parado"] == 4 and x["pronto"] and x["sugestao"] == "Oi, Pet Feliz" and x["conversa_lida"] == "1", x
+    mexer_reengajar({"ids": ["h"], "acao": "adicionar"})
+    assert h()["reeng"] == "fila" and h()["reeng_msg"] == "Oi, Pet Feliz" and not h()["pronto"]
+    mexer_reengajar({"ids": ["h"], "acao": "editar", "mensagem": "Oi! Viu a proposta?"})
+    resultado_reengajar({"id": "h", "status": "enviado"})
+    x = h()
+    assert (x["reeng"], x["reengajamentos"], x["conversa_de"], x["parado"], x["conversa_previa"]) == (
+        "enviado", 1, "eu", 0, "Oi! Viu a proposta?") and "reengajamento enviado" in x["notas"], x
+    registrar_conversas({"itens": [{"id": "h", "quando": atras(4), "de": "eu"}]})  # 4 dias sem resposta
+    assert h()["pronto"] and h()["sugestao"] == "Última"  # a 2ª caixa está vazia
+    mexer_reengajar({"ids": ["h"], "acao": "adicionar"})
+    registrar_resposta({"id": "h", "tipo": "interesse", "texto": "Vou ver"})  # respondeu: sai da fila e recomeça
+    x = h()
+    assert (x["reeng"], x["reengajamentos"], x["conversa_de"], x["sugestao"]) == (None, 0, "lead", None), x
+    registrar_conversas({"itens": [{"id": "h", "quando": atras(5), "de": "lead"}]})  # ele falou por último: a vez é sua
+    mexer_reengajar({"ids": ["h"], "acao": "adicionar"})  # sem modelo para esse caso: só com mensagem escrita
+    assert h()["pronto"] and h()["reeng"] is None
+    mexer_reengajar({"ids": ["h"], "acao": "adicionar", "mensagem": "Desculpa a demora!"})
+    assert h()["reeng_msg"] == "Desculpa a demora!"
+    mexer_reengajar({"ids": ["h"], "acao": "remover"})
+    salvar_lead({"id": "h", "proximo_em": (datetime.now() + timedelta(days=2)).strftime("%Y-%m-%d")})
+    assert not h()["pronto"]  # combinado para depois
+    salvar_lead({"id": "h", "proximo_em": ""})
+    with bot.db() as c:
+        c.execute("UPDATE leads SET reengajamentos=3 WHERE id='h'")
+        c.commit()
+    assert h()["esgotado"] and not h()["pronto"]
+    for ruim in ({"itens": [{"id": "h", "quando": "amanhã", "de": "eu"}]}, {"itens": [{"id": "h", "quando": "Ontem", "de": "x"}]},
+                 {"itens": []}, {"itens": [{"id": "zz", "quando": "Ontem", "de": "eu"}]}):
+        try:
+            registrar_conversas(ruim)
+            raise AssertionError(ruim)
+        except ValueError:
+            pass
     global BACKUPS
     BACKUPS = os.path.join(os.path.dirname(bot.DB), "bk")
     backup(manter=1)

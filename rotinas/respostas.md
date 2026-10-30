@@ -33,6 +33,7 @@ Responda e reporte em português do Brasil.
 - **interesse:** o lead vai para Respondeu e entra no dashboard.
 - **recusa:** o lead vai para Perdido, com o motivo "Sem interesse".
 - **automatica:** o painel só anota. O lead continua esperando resposta.
+- Lead que já está no dashboard: interesse ou recusa só anota e registra a mensagem dele como a última da conversa. Ele sai da fila de reengajamento, e a etapa não muda.
 - Cada resposta fica anotada nas notas do lead. A mesma prévia registrada duas vezes é ignorada.
 
 ## 5. No relatório

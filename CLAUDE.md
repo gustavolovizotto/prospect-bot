@@ -61,6 +61,7 @@ Depois, monte o perfil:
     - Use as variáveis. Não prometa nada que o vendedor não disse.
   - **`contato.propostas`:** mensagens prontas para quem responder.
   - **`contato.followup`:** escreva o texto, mas deixe `"ativo": false`.
+  - **`contato.reengajamento`:** até 3 modelos de mensagem para quem está no dashboard e parou de responder. O Claude confere o WhatsApp e monta a fila de reengajamento do dashboard (`rotinas/reengajar.md`). O envio é pelo vendedor, ou pelo Claude quando o vendedor pedir.
   - **`instrucoes` de cada etapa:** o que o vendedor disse em linguagem natural e que não cabe nos pontos.
 - Salve com `POST /api/perfis {"acao":"salvar","perfil":{…}}`. A resposta traz em `previa` a mensagem pronta com um lead de exemplo.
 - **Mostre a prévia ao vendedor e só siga com a aprovação dele.** Depois ative: `POST /api/perfis {"acao":"ativar","id":"…"}`.
@@ -106,6 +107,6 @@ Depois, monte o perfil:
 - `painel.py`: servidor local e API. A lista de rotas está no topo do arquivo.
 - `static/`: a tela, sem build.
 - `rotinas/`:
-  - o passo a passo das rotinas (`qualificar.md`, `disparar.md`, `respostas.md`);
+  - o passo a passo das rotinas (`qualificar.md`, `disparar.md`, `respostas.md`, `reengajar.md`);
   - os modelos das tarefas agendadas (`tarefas.md`).
 - `instalar-painel.sh`: LaunchAgent do Mac (`--mostrar` só mostra, `--remover` desliga).

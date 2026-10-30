@@ -160,6 +160,15 @@ PERFIL_PADRAO = {
         "followup": {"ativo": False, "dias": 3,
                      "mensagem": "{saudacao}! Só passando para saber se você conseguiu ver minha mensagem acima.\n\n"
                                  "Se fizer sentido, posso te mandar um exemplo de como ficaria o site da {empresa}, sem compromisso."},
+        # modelos para a fila de reengajamento: lead do dashboard parado há `dias` depois da sua última mensagem
+        # recebe a 1ª, depois a 2ª... Vazia é pulada. O Claude adapta cada uma à conversa.
+        "reengajamento": {"dias": 3, "mensagens": [
+            "Oi, tudo bem? Conseguiu dar uma olhada no que te mandei sobre o site da {empresa}? "
+            "Se tiver qualquer dúvida, é só me chamar.",
+            "Oi! Passando para saber se ainda faz sentido seguir com o site da {empresa}. "
+            "Se quiser, ajusto o que precisar, sem compromisso.",
+            "Oi! Como não tive retorno, vou deixar por aqui para não incomodar. "
+            "Se mais para frente fizer sentido, é só me chamar que retomamos de onde paramos."]},
         # mensagens prontas para quem já está no dashboard; você copia ou abre no WhatsApp e envia
         "propostas": [
             {"titulo": "Mostrar o protótipo",
@@ -204,9 +213,13 @@ def db():
     # perfil_venda: perfil que qualificou o lead (NULL = padrão)
     # quadro_em: quando foi para o dashboard (NULL = fora) · prototipo, valor, proximo, proximo_em: acompanhamento
     # respondeu_em: 1ª resposta (métricas) · etapa_em: última troca de etapa · followup_em: quando o follow-up saiu
+    # conversa_*: última mensagem da conversa no WhatsApp, lida pelo Claude na lista de conversas (em, de eu|lead,
+    #   lida = o lead visualizou a sua, previa, conferida_em) · reeng: NULL | fila | enviado | falhou (fila de
+    #   reengajamento), com reeng_msg e reeng_em · reengajamentos: quantos saíram desde a última mensagem do lead
     for col in ("notas", "motivo", "envio", "envio_msg", "envio_em", "envio_erro", "analise", "tel_tipo",
                 "perfil_venda", "quadro_em", "prototipo", "valor", "respondeu_em", "etapa_em", "proximo", "proximo_em",
-                "followup_em"):
+                "followup_em", "conversa_em", "conversa_de", "conversa_lida", "conversa_previa", "conversa_conferida_em",
+                "reeng", "reeng_msg", "reeng_em"):
         if col not in cols:
             c.execute(f"ALTER TABLE leads ADD COLUMN {col} TEXT")
             if col == "quadro_em":  # quem já respondeu começa no dashboard
@@ -217,6 +230,9 @@ def db():
             if col == "etapa_em":
                 c.execute("UPDATE leads SET etapa_em=COALESCE(quadro_em, envio_em, criado)")
             c.commit()
+    if "reengajamentos" not in cols:
+        c.execute("ALTER TABLE leads ADD COLUMN reengajamentos INTEGER DEFAULT 0")
+        c.commit()
     return c
 
 

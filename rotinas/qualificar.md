@@ -40,6 +40,7 @@ Use as cidades pendentes de `pv.prospeccao.cidades`, na ordem. Para cada uma:
 - Carregue as ferramentas `mcp__claude-in-chrome__*` com ToolSearch e chame `tabs_context_mcp {createIfEmpty:true}`.
 - Navegue para `https://web.whatsapp.com/` e espere `#pane-side` aparecer. Se aparecer QR code (deslogado), pare esta etapa e avise no relatório.
 - Antes de conferir os fixos, **detecte as respostas** seguindo `rotinas/respostas.md`.
+- Depois, **monte a fila de reengajamento** seguindo `rotinas/reengajar.md`, passos 1 a 4. Não envie nada.
 - Para cada fixo, normalize o número: só dígitos, com 55 na frente → `55DDXXXXXXXX`. Depois rode:
   - `navigate` para `https://web.whatsapp.com/send?phone=<numero>` com `force:true`;
   - `computer wait 1.5`;
@@ -79,6 +80,7 @@ Para cada lead pronto, do maior score para o menor:
 ## 8. Relatório final (curto)
 - Perfil de venda usado (`pv.nome`).
 - Respostas detectadas (veja `rotinas/respostas.md`).
+- Reengajamento: quem entrou na fila, quem estava esperando o vendedor responder (veja `rotinas/reengajar.md`).
 - Quantos ficaram na fila para amanhã (nome · cidade · nicho).
 - Quantas cidades foram prospectadas, quantos leads novos entraram e quantos fixos foram conferidos (com e sem WhatsApp).
 - O que foi descartado e por quê.
